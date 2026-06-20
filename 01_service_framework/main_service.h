@@ -1,0 +1,8 @@
+//
+// Created by iFOURYTWOLF on 26-6-7.
+//
+
+#ifndef LINUX_C_SECURITY_GATEWAY_MAIN_SERVICE_H
+#define LINUX_C_SECURITY_GATEWAY_MAIN_SERVICE_H
+int main_t(int argc, char *argv[]);
+#endif //LINUX_C_SECURITY_GATEWAY_MAIN_SERVICE_H
