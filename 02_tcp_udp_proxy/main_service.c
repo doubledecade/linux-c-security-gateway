@@ -10,18 +10,37 @@
 #include <errno.h>
 #include <pthread.h>
 #include <limits.h>
-#include <libnet.h>
+#include <stdint.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
+#include <stdbool.h>
 #include "config.h"
 #include "log.h"
+#define BACKLOG 65535
+#define MAX_EVENTS 1024
+#define IO_BUF_SIZE 4096
 #define FILE_PATH_NUMBER_MAX 100
 #define FILE_PATH "./server.conf"
+
+#ifndef IP_FREEBIND
+#define IP_FREEBIND 15
+#endif
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_reload = 0;
 static char file_path[FILE_PATH_NUMBER_MAX] = FILE_PATH;
 static char real_config_path[PATH_MAX];
 static server_config_t cfg;
 typedef struct task {
-    int id;
+    int client_fd;
+    char peer[64];
     struct task *next;
 } task_t;
 
@@ -198,6 +217,9 @@ static void task_queue_destroy(task_queue_t *q)
     task = q->head;
     while (task != NULL) {
         next = task->next;
+        if (task->client_fd >= 0) {
+            close(task->client_fd);
+        }
         free(task);
         task = next;
     }
@@ -292,17 +314,40 @@ static void task_queue_stop(task_queue_t *q)
 
 /* ================= 工作线程 ================= */
 
+static int send_all_or_close(int fd, const char *buf, size_t len);
+
 static void process_task(task_t *task)
 {
-    char buf[128];
+    char buf[IO_BUF_SIZE];
+    int fd = task->client_fd;
 
-    snprintf(buf, sizeof(buf), "process task id=%d", task->id);
-    LOG_DEBUG("process task id=%d", task->id);
+    LOG_INFO("worker handle client: fd=%d, peer=%s", fd, task->peer);
 
-    /*
-     * 模拟任务处理耗时
-     */
-    sleep(1);
+    for (;;) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+
+        if (n > 0) {
+            if (send_all_or_close(fd, buf, (size_t)n) == -1) {
+                break;
+            }
+            continue;
+        }
+
+        if (n == 0) {
+            LOG_INFO("client closed: fd=%d, peer=%s", fd, task->peer);
+            break;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        LOG_ERROR("recv failed: fd=%d, peer=%s, errno=%d", fd, task->peer, errno);
+        break;
+    }
+
+    close(fd);
+    task->client_fd = -1;
 }
 
 static void *worker_thread(void *arg)
@@ -344,6 +389,198 @@ static void usage(const char *prog)
     printf("  -h    show help\n");
 }
 
+static int addfd(int epollfd, int fd, uint32_t ev)
+{
+    struct epoll_event event;
+
+    memset(&event, 0, sizeof(event));
+    event.data.fd = fd;
+    event.events = ev;
+
+    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event) == -1) {
+        LOG_ERROR("epoll_ctl add failed: fd=%d, errno=%d", fd, errno);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int setSocketOpt(int socketHandle, int level, int optname)
+{
+    int ret = 0;
+    int reuse = 1;
+
+    ret = setsockopt(socketHandle, level, optname, &reuse, sizeof(reuse));
+    if (ret < 0)
+    {
+        LOG_ERROR("setsockopt Set socket options error.");
+    }
+    return ret;
+}
+
+static bool set_nonBlocking(int nfd)
+{
+    int flags = fcntl(nfd, F_GETFL, 0);
+
+    if (flags == -1) {
+        return false;
+    }
+
+    if (fcntl(nfd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool set_blocking(int nfd)
+{
+    int flags = fcntl(nfd, F_GETFL, 0);
+
+    if (flags == -1) {
+        return false;
+    }
+
+    if (fcntl(nfd, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+        return false;
+    }
+
+    return true;
+}
+
+static int send_all_or_close(int fd, const char *buf, size_t len)
+{
+    size_t sent = 0;
+
+    while (sent < len) {
+        ssize_t n = send(fd, buf + sent, len - sent, MSG_NOSIGNAL);
+
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+
+        if (n == -1 && errno == EINTR) {
+            continue;
+        }
+
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            LOG_WARN("send would block, close slow client: fd=%d", fd);
+            return -1;
+        }
+
+        LOG_ERROR("send failed: fd=%d, errno=%d", fd, errno);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void accept_clients(int listen_fd)
+{
+    for (;;) {
+        struct sockaddr_in peer_addr;
+        socklen_t peer_len = sizeof(peer_addr);
+        int client_fd = accept(listen_fd, (struct sockaddr *)&peer_addr, &peer_len);
+
+        if (client_fd == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+
+            LOG_ERROR("accept failed: errno=%d", errno);
+            return;
+        }
+
+        if (!set_blocking(client_fd)) {
+            LOG_ERROR("set client blocking failed: fd=%d, errno=%d", client_fd, errno);
+            close(client_fd);
+            continue;
+        }
+
+        char peer_ip[INET_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
+            snprintf(peer_ip, sizeof(peer_ip), "unknown");
+        }
+
+        task_t *task = malloc(sizeof(*task));
+        if (task == NULL) {
+            LOG_ERROR("malloc client task failed: fd=%d", client_fd);
+            close(client_fd);
+            continue;
+        }
+
+        task->client_fd = client_fd;
+        task->next = NULL;
+        snprintf(task->peer,
+                 sizeof(task->peer),
+                 "%s:%u",
+                 peer_ip,
+                 (unsigned int)ntohs(peer_addr.sin_port));
+
+        if (task_queue_push(&g_queue, task) == -1) {
+            close(client_fd);
+            free(task);
+            return;
+        }
+
+        LOG_INFO("client dispatched: fd=%d, peer=%s", client_fd, task->peer);
+    }
+}
+
+static int createListenSocket(const char *listenIp, uint16_t listenPort)
+{
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        LOG_ERROR("Error socket\n");
+        return -1;
+    }
+
+    if (setSocketOpt(listen_fd, SOL_SOCKET, SO_REUSEADDR) < 0)
+    {
+        LOG_ERROR("createListenSocket Option setting failed\n");
+        close(listen_fd);
+        return -1;
+    }
+
+    // 设置监听socket为非阻塞
+    if (!set_nonBlocking(listen_fd)) {
+        close(listen_fd);
+        LOG_ERROR("Error set_nonBlocking\n");
+        return -1;
+    }
+    const int one = 1;
+    if (setsockopt(listen_fd, IPPROTO_IP, IP_FREEBIND, &one, sizeof(one)) < 0)
+    {
+        close(listen_fd);
+        return -1;
+    }
+    struct sockaddr_in listen_addr;
+    memset(&listen_addr, 0, sizeof(listen_addr));
+    listen_addr.sin_family = AF_INET;
+    if (inet_pton(AF_INET, listenIp, &listen_addr.sin_addr) != 1) {
+        LOG_ERROR("invalid listen ip: %s", listenIp);
+        close(listen_fd);
+        return -1;
+    }
+    listen_addr.sin_port = htons(listenPort);
+    if (bind(listen_fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
+        LOG_ERROR("Error bind\n");
+        close(listen_fd);
+        return -1;
+    }
+
+    if (listen(listen_fd, BACKLOG) < 0) {
+        LOG_ERROR("Error listen\n");
+        close(listen_fd);
+        return -1;
+    }
+    return listen_fd;
+}
 /* ================= main ================= */
 
 int main_t(int argc, char *argv[])
@@ -351,7 +588,6 @@ int main_t(int argc, char *argv[])
     int daemon_mode = 0;
     int opt;
     int i;
-    int task_id = 0;
     pthread_t *workers;
 
     while ((opt = getopt(argc, argv, "dhc:")) != -1) {
@@ -437,9 +673,25 @@ int main_t(int argc, char *argv[])
      * 这里先模拟每 2 秒产生一个任务。
      * 以后你可以替换成 accept/recv/epoll 等逻辑。
      */
-    while (!g_stop) {
-        task_t *task;
+    // 等待监听
+    struct epoll_event events[MAX_EVENTS];
+    int epollfd = epoll_create1(EPOLL_CLOEXEC);
+    int sockfd = -1;
 
+    if (epollfd == -1) {
+        LOG_ERROR("epoll_create1 failed: errno=%d", errno);
+        goto quit;
+    }
+
+    sockfd = createListenSocket(cfg.listen_ip, (uint16_t)cfg.listen_port);
+    if (sockfd < 0){
+        goto quit;
+    }
+
+    if (addfd(epollfd, sockfd, EPOLLIN | EPOLLERR | EPOLLHUP) == -1) {
+        goto quit;
+    }
+    while (!g_stop) {
         if (g_reload) {
             g_reload = 0;
             if(reload_config(real_config_path)==-1){
@@ -457,22 +709,43 @@ int main_t(int argc, char *argv[])
             }
         }
 
-        task = malloc(sizeof(*task));
-        if (task == NULL) {
-            LOG_ERROR("malloc task failed");
-            sleep(1);
-            continue;
+        //等待epoll事件
+        int num_events = epoll_wait(epollfd, events, MAX_EVENTS, 1000);
+        if(num_events < 0){
+            if (errno != EINTR) {
+                LOG_ERROR("ERROR epoll_wait , num_events=%d, errno=%d\n", num_events, errno);
+                break;
+            } else {
+                continue;
+            }
         }
+        for(int j =0 ;j<num_events;j++){
+            int event_fd = events[j].data.fd;
+            uint32_t event_flags = events[j].events;
 
-        task->id = ++task_id;
-        task->next = NULL;
+            if (event_fd != sockfd) {
+                LOG_WARN("unexpected epoll fd: fd=%d, events=%u", event_fd, event_flags);
+                continue;
+            }
 
-        if (task_queue_push(&g_queue, task) == -1) {
-            free(task);
-            break;
+            if (event_flags & (EPOLLERR | EPOLLHUP)) {
+                LOG_ERROR("listen socket error: fd=%d, events=%u", sockfd, event_flags);
+                g_stop = 1;
+                break;
+            }
+
+            if (event_flags & EPOLLIN) {
+                accept_clients(sockfd);
+            }
         }
+    }
+quit:
+    if (sockfd >= 0) {
+        close(sockfd);
+    }
 
-        sleep(2);
+    if (epollfd >= 0) {
+        close(epollfd);
     }
 
     /*
