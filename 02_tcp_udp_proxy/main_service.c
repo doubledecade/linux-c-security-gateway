@@ -38,9 +38,26 @@ static volatile sig_atomic_t g_reload = 0;
 static char file_path[FILE_PATH_NUMBER_MAX] = FILE_PATH;
 static char real_config_path[PATH_MAX];
 static server_config_t cfg;
+
+typedef struct channel_context {
+    int fd;
+    listener_config_t config;
+} channel_context_t;
+
+typedef enum task_type {
+    TASK_TCP_CLIENT = 0,
+    TASK_UDP_PACKET
+} task_type_t;
+
 typedef struct task {
+    task_type_t task_type;
+    listener_config_t channel;
     int client_fd;
     char peer[64];
+    struct sockaddr_in peer_addr;
+    socklen_t peer_addr_len;
+    size_t data_len;
+    char data[IO_BUF_SIZE];
     struct task *next;
 } task_t;
 
@@ -217,7 +234,7 @@ static void task_queue_destroy(task_queue_t *q)
     task = q->head;
     while (task != NULL) {
         next = task->next;
-        if (task->client_fd >= 0) {
+        if (task->task_type == TASK_TCP_CLIENT && task->client_fd >= 0) {
             close(task->client_fd);
         }
         free(task);
@@ -321,7 +338,42 @@ static void process_task(task_t *task)
     char buf[IO_BUF_SIZE];
     int fd = task->client_fd;
 
-    LOG_INFO("worker handle client: fd=%d, peer=%s", fd, task->peer);
+    if (task->task_type == TASK_UDP_PACKET) {
+        if(task->channel.service_type==SERVICE_TYPE_ECHO) {
+            LOG_INFO("worker handle udp packet: fd=%d, peer=%s, service_type=%d",
+                     fd,
+                     task->peer,
+                     task->channel.service_type);
+
+            ssize_t n = sendto(fd,
+                               task->data,
+                               task->data_len,
+                               0,
+                               (struct sockaddr *) &task->peer_addr,
+                               task->peer_addr_len);
+            if (n == -1) {
+                LOG_ERROR("udp sendto failed: fd=%d, peer=%s, errno=%d",
+                          fd,
+                          task->peer,
+                          errno);
+            } else {
+                LOG_INFO("udp packet handled: fd=%d, peer=%s, bytes=%zd",
+                         fd,
+                         task->peer,
+                         n);
+            }
+            return;
+        }
+        else{
+            //代理模式
+            return;
+        }
+    }
+
+    LOG_INFO("worker handle client: fd=%d, peer=%s, service_type=%d",
+             fd,
+             task->peer,
+             task->channel.service_type);
 
     for (;;) {
         ssize_t n = recv(fd, buf, sizeof(buf), 0);
@@ -389,12 +441,12 @@ static void usage(const char *prog)
     printf("  -h    show help\n");
 }
 
-static int addfd(int epollfd, int fd, uint32_t ev)
+static int addfd(int epollfd, int fd, uint32_t ev, void *ptr)
 {
     struct epoll_event event;
 
     memset(&event, 0, sizeof(event));
-    event.data.fd = fd;
+    event.data.ptr = ptr;
     event.events = ev;
 
     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event) == -1) {
@@ -476,8 +528,10 @@ static int send_all_or_close(int fd, const char *buf, size_t len)
     return 0;
 }
 
-static void accept_clients(int listen_fd)
+static void accept_clients(channel_context_t *channel)
 {
+    int listen_fd = channel->fd;
+
     for (;;) {
         struct sockaddr_in peer_addr;
         socklen_t peer_len = sizeof(peer_addr);
@@ -514,6 +568,9 @@ static void accept_clients(int listen_fd)
             continue;
         }
 
+        memset(task, 0, sizeof(*task));
+        task->task_type = TASK_TCP_CLIENT;
+        task->channel = channel->config;
         task->client_fd = client_fd;
         task->next = NULL;
         snprintf(task->peer,
@@ -528,7 +585,80 @@ static void accept_clients(int listen_fd)
             return;
         }
 
-        LOG_INFO("client dispatched: fd=%d, peer=%s", client_fd, task->peer);
+        LOG_INFO("client dispatched: fd=%d, peer=%s, service_type=%d",
+                 client_fd,
+                 task->peer,
+                 task->channel.service_type);
+    }
+}
+
+static void dispatch_udp_packets(channel_context_t *channel)
+{
+    int udp_fd = channel->fd;
+
+    for (;;) {
+        task_t *task;
+        char peer_ip[INET_ADDRSTRLEN] = {0};
+        struct sockaddr_in peer_addr;
+        socklen_t peer_len = sizeof(peer_addr);
+        ssize_t n;
+
+        task = malloc(sizeof(*task));
+        if (task == NULL) {
+            LOG_ERROR("malloc udp task failed: fd=%d", udp_fd);
+            return;
+        }
+
+        memset(task, 0, sizeof(*task));
+        n = recvfrom(udp_fd,
+                     task->data,
+                     sizeof(task->data),
+                     0,
+                     (struct sockaddr *)&peer_addr,
+                     &peer_len);
+
+        if (n == -1) {
+            free(task);
+
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+
+            LOG_ERROR("udp recvfrom failed: fd=%d, errno=%d", udp_fd, errno);
+            return;
+        }
+
+        task->task_type = TASK_UDP_PACKET;
+        task->channel = channel->config;
+        task->client_fd = udp_fd;
+        task->peer_addr = peer_addr;
+        task->peer_addr_len = peer_len;
+        task->data_len = (size_t)n;
+
+        if (inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
+            snprintf(peer_ip, sizeof(peer_ip), "unknown");
+        }
+
+        snprintf(task->peer,
+                 sizeof(task->peer),
+                 "%s:%u",
+                 peer_ip,
+                 (unsigned int)ntohs(peer_addr.sin_port));
+
+        if (task_queue_push(&g_queue, task) == -1) {
+            free(task);
+            return;
+        }
+
+        LOG_INFO("udp packet dispatched: fd=%d, peer=%s, bytes=%zd, service_type=%d",
+                 udp_fd,
+                 task->peer,
+                 n,
+                 task->channel.service_type);
     }
 }
 
@@ -580,6 +710,53 @@ static int createListenSocket(const char *listenIp, uint16_t listenPort)
         return -1;
     }
     return listen_fd;
+}
+
+static int createUdpSocket(const char *listenIp, uint16_t listenPort)
+{
+    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd < 0) {
+        LOG_ERROR("Error udp socket\n");
+        return -1;
+    }
+
+    if (setSocketOpt(udp_fd, SOL_SOCKET, SO_REUSEADDR) < 0)
+    {
+        LOG_ERROR("createUdpSocket Option setting failed\n");
+        close(udp_fd);
+        return -1;
+    }
+
+    if (!set_nonBlocking(udp_fd)) {
+        close(udp_fd);
+        LOG_ERROR("Error udp set_nonBlocking\n");
+        return -1;
+    }
+
+    const int one = 1;
+    if (setsockopt(udp_fd, IPPROTO_IP, IP_FREEBIND, &one, sizeof(one)) < 0)
+    {
+        close(udp_fd);
+        return -1;
+    }
+
+    struct sockaddr_in listen_addr;
+    memset(&listen_addr, 0, sizeof(listen_addr));
+    listen_addr.sin_family = AF_INET;
+    if (inet_pton(AF_INET, listenIp, &listen_addr.sin_addr) != 1) {
+        LOG_ERROR("invalid udp listen ip: %s", listenIp);
+        close(udp_fd);
+        return -1;
+    }
+    listen_addr.sin_port = htons(listenPort);
+
+    if (bind(udp_fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
+        LOG_ERROR("Error udp bind\n");
+        close(udp_fd);
+        return -1;
+    }
+
+    return udp_fd;
 }
 /* ================= main ================= */
 
@@ -643,7 +820,16 @@ int main_t(int argc, char *argv[])
         return 1;
     }
     LOG_INFO("program start");
-    LOG_INFO("listen_ip=%s, port=%d\n", cfg.listen_ip, cfg.listen_port);
+    LOG_INFO("listener_count=%d", cfg.listener_count);
+    for (i = 0; i < cfg.listener_count; i++) {
+        LOG_INFO("listener[%d]: listen_type=%s, listen_ip=%s, listen_port=%d, type=%s, service_type=%d",
+                 i,
+                 cfg.listeners[i].listen_type,
+                 cfg.listeners[i].listen_ip,
+                 cfg.listeners[i].listen_port,
+                 cfg.listeners[i].type,
+                 cfg.listeners[i].service_type);
+    }
     /*
      * 创建 worker 线程。
      */
@@ -676,21 +862,61 @@ int main_t(int argc, char *argv[])
     // 等待监听
     struct epoll_event events[MAX_EVENTS];
     int epollfd = epoll_create1(EPOLL_CLOEXEC);
-    int sockfd = -1;
+    channel_context_t channels[MAX_LISTENERS];
+    int listen_count = 0;
+
+    for (i = 0; i < MAX_LISTENERS; i++) {
+        memset(&channels[i], 0, sizeof(channels[i]));
+        channels[i].fd = -1;
+    }
 
     if (epollfd == -1) {
         LOG_ERROR("epoll_create1 failed: errno=%d", errno);
         goto quit;
     }
 
-    sockfd = createListenSocket(cfg.listen_ip, (uint16_t)cfg.listen_port);
-    if (sockfd < 0){
+    for (i = 0; i < cfg.listener_count; i++) {
+        listener_config_t *listener = &cfg.listeners[i];
+        int listen_fd;
+
+        if (listener->proto == LISTEN_PROTO_UDP) {
+            listen_fd = createUdpSocket(listener->listen_ip, (uint16_t)listener->listen_port);
+        } else {
+            listen_fd = createListenSocket(listener->listen_ip, (uint16_t)listener->listen_port);
+        }
+
+        if (listen_fd < 0){
+            goto quit;
+        }
+
+        channels[listen_count].fd = listen_fd;
+        channels[listen_count].config = *listener;
+
+        if (addfd(epollfd,
+                  listen_fd,
+                  EPOLLIN | EPOLLERR | EPOLLHUP,
+                  &channels[listen_count]) == -1) {
+            close(listen_fd);
+            channels[listen_count].fd = -1;
+            goto quit;
+        }
+
+        listen_count++;
+
+        LOG_INFO("listener started: fd=%d, listen_type=%s, ip=%s, port=%d, type=%s, service_type=%d",
+                 listen_fd,
+                 listener->listen_type,
+                 listener->listen_ip,
+                 listener->listen_port,
+                 listener->type,
+                 listener->service_type);
+    }
+
+    if (listen_count == 0) {
+        LOG_ERROR("no listener configured");
         goto quit;
     }
 
-    if (addfd(epollfd, sockfd, EPOLLIN | EPOLLERR | EPOLLHUP) == -1) {
-        goto quit;
-    }
     while (!g_stop) {
         if (g_reload) {
             g_reload = 0;
@@ -720,28 +946,37 @@ int main_t(int argc, char *argv[])
             }
         }
         for(int j =0 ;j<num_events;j++){
-            int event_fd = events[j].data.fd;
+            channel_context_t *channel = (channel_context_t *)events[j].data.ptr;
             uint32_t event_flags = events[j].events;
 
-            if (event_fd != sockfd) {
-                LOG_WARN("unexpected epoll fd: fd=%d, events=%u", event_fd, event_flags);
+            if (channel == NULL || channel->fd < 0) {
+                LOG_WARN("unexpected epoll event: ptr=%p, events=%u",
+                         (void *)channel,
+                         event_flags);
                 continue;
             }
 
             if (event_flags & (EPOLLERR | EPOLLHUP)) {
-                LOG_ERROR("listen socket error: fd=%d, events=%u", sockfd, event_flags);
+                LOG_ERROR("listen socket error: fd=%d, events=%u", channel->fd, event_flags);
                 g_stop = 1;
                 break;
             }
 
             if (event_flags & EPOLLIN) {
-                accept_clients(sockfd);
+                if (channel->config.proto == LISTEN_PROTO_UDP) {
+                    dispatch_udp_packets(channel);
+                } else {
+                    accept_clients(channel);
+                }
             }
         }
     }
 quit:
-    if (sockfd >= 0) {
-        close(sockfd);
+    for (i = 0; i < listen_count; i++) {
+        if (channels[i].fd >= 0) {
+            close(channels[i].fd);
+            channels[i].fd = -1;
+        }
     }
 
     if (epollfd >= 0) {
