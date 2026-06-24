@@ -15,9 +15,22 @@
 #define MSG_NOSIGNAL 0
 #endif
 
+#ifndef DEFAULT_HOST
 #define DEFAULT_HOST "127.0.0.1"
+#endif
+
+#ifndef DEFAULT_PORT
 #define DEFAULT_PORT "8080"
+#endif
+
+#ifndef DEFAULT_MESSAGE
 #define DEFAULT_MESSAGE "hello echo"
+#endif
+
+#ifndef TEST_KIND
+#define TEST_KIND "echo"
+#endif
+
 #define DEFAULT_COUNT 1
 #define DEFAULT_TIMEOUT_MS 3000
 #define MAX_RESPONSE_SIZE 65535
@@ -263,7 +276,7 @@ static int recv_exact(int fd, char *buf, size_t len, int timeout_ms)
         }
 
         if (n == 0) {
-            fprintf(stderr, "connection closed before full echo was received\n");
+            fprintf(stderr, "connection closed before full %s response was received\n", TEST_KIND);
             return -1;
         }
 
@@ -278,10 +291,10 @@ static int recv_exact(int fd, char *buf, size_t len, int timeout_ms)
     return 0;
 }
 
-static int check_echo(const char *expected, const char *actual, size_t len)
+static int check_response(const char *expected, const char *actual, size_t len)
 {
     if (memcmp(expected, actual, len) != 0) {
-        fprintf(stderr, "echo mismatch\n");
+        fprintf(stderr, "%s mismatch\n", TEST_KIND);
         fprintf(stderr, "expected: %.*s\n", (int)len, expected);
         fprintf(stderr, "actual:   %.*s\n", (int)len, actual);
         return -1;
@@ -325,11 +338,11 @@ static int run_tcp_test(const options_t *opts)
             goto out;
         }
 
-        if (check_echo(opts->message, response, message_len) == -1) {
+        if (check_response(opts->message, response, message_len) == -1) {
             goto out;
         }
 
-        printf("tcp echo ok: %d/%d bytes=%zu\n", i + 1, opts->count, message_len);
+        printf("tcp %s ok: %d/%d bytes=%zu\n", TEST_KIND, i + 1, opts->count, message_len);
     }
 
     ret = 0;
@@ -418,15 +431,18 @@ static int run_udp_test(const options_t *opts)
         }
 
         if ((size_t)n != message_len) {
-            fprintf(stderr, "udp echo size mismatch: expected=%zu actual=%zd\n", message_len, n);
+            fprintf(stderr, "udp %s size mismatch: expected=%zu actual=%zd\n",
+                    TEST_KIND,
+                    message_len,
+                    n);
             goto out;
         }
 
-        if (check_echo(opts->message, response, message_len) == -1) {
+        if (check_response(opts->message, response, message_len) == -1) {
             goto out;
         }
 
-        printf("udp echo ok: %d/%d bytes=%zu\n", i + 1, opts->count, message_len);
+        printf("udp %s ok: %d/%d bytes=%zu\n", TEST_KIND, i + 1, opts->count, message_len);
     }
 
     ret = 0;

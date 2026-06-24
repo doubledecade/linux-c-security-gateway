@@ -28,3 +28,11 @@ add_executable(echo_test tools/echo_test.c)
 target_compile_definitions(echo_test PRIVATE
         _DEFAULT_SOURCE
         _POSIX_C_SOURCE=200809L)
+
+add_executable(proxy_test tools/echo_test.c)
+target_compile_definitions(proxy_test PRIVATE
+        _DEFAULT_SOURCE
+        _POSIX_C_SOURCE=200809L
+        "DEFAULT_PORT=\"18080\""
+        "DEFAULT_MESSAGE=\"hello proxy\""
+        "TEST_KIND=\"proxy\"")

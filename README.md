@@ -51,6 +51,12 @@ CMake 会把 `server.conf` 复制到构建目录，因此从 `cmake-build-debug`
 /usr/local/bin/cmake --build cmake-build-debug --target echo_test -- -j 4
 ```
 
+如果需要构建 proxy 测试工具：
+
+```bash
+/usr/local/bin/cmake --build cmake-build-debug --target proxy_test -- -j 4
+```
+
 ## 运行
 
 从构建目录前台运行：
@@ -136,6 +142,30 @@ cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
 
 当前 `server.conf` 默认同时监听 `tcp,0.0.0.0,8080,echo` 和 `udp,0.0.0.0,8080,echo`，因此默认测试可以直接覆盖 TCP/UDP echo。
 默认配置还会启动 `tcp,0.0.0.0,18080,proxy,127.0.0.1,8080` 和 `udp,0.0.0.0,18080,proxy,127.0.0.1,8080`，可以用 18080 端口测试 TCP/UDP 代理转发。
+
+## TCP/UDP Proxy 测试工具
+
+`proxy_test` 复用 `echo_test` 的 TCP/UDP 收发校验逻辑，默认连接 `127.0.0.1:18080`，用于测试默认配置里的 TCP/UDP proxy 是否能转发到 `127.0.0.1:8080`。
+
+先启动服务端：
+
+```bash
+cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
+./linux_c_security_gateway
+```
+
+在另一个终端运行默认 proxy 测试：
+
+```bash
+cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
+./proxy_test
+```
+
+默认测试等价于：
+
+```bash
+./proxy_test -M both -a 127.0.0.1 -p 18080 -s "hello proxy" -n 1 -T 3000
+```
 
 ## 配置文件
 
