@@ -17,6 +17,7 @@ add_executable(linux_c_security_gateway main.c
         02_tcp_udp_proxy/main_service.h)
 
 configure_file(server.conf server.conf COPYONLY)
+configure_file(server_proxy_only.conf server_proxy_only.conf COPYONLY)
 
 target_compile_definitions(linux_c_security_gateway PRIVATE
         _DEFAULT_SOURCE
@@ -36,3 +37,8 @@ target_compile_definitions(proxy_test PRIVATE
         "DEFAULT_PORT=\"18080\""
         "DEFAULT_MESSAGE=\"hello proxy\""
         "TEST_KIND=\"proxy\"")
+
+add_executable(target_echo_server tools/target_echo_server.c)
+target_compile_definitions(target_echo_server PRIVATE
+        _DEFAULT_SOURCE
+        _POSIX_C_SOURCE=200809L)

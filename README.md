@@ -167,6 +167,37 @@ cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
 ./proxy_test -M both -a 127.0.0.1 -p 18080 -s "hello proxy" -n 1 -T 3000
 ```
 
+## 独立目的端接收程序
+
+如果要测试真实的 `proxy_test -> linux_c_security_gateway -> 目的端程序` 链路，可以使用 `target_echo_server` 作为独立目的端。它默认监听 `127.0.0.1:8080`，TCP/UDP 收到什么就原样回什么。
+
+构建：
+
+```bash
+cmake --build cmake-build-debug --target target_echo_server linux_c_security_gateway proxy_test -- -j 4
+```
+
+终端 1 启动目的端：
+
+```bash
+cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
+./target_echo_server -M both -a 127.0.0.1 -p 8080
+```
+
+终端 2 用 proxy-only 配置启动网关，避免网关内置 echo 和独立目的端抢占 8080：
+
+```bash
+cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
+./linux_c_security_gateway -c /mnt/d/code/linux-c-security-gateway/server_proxy_only.conf
+```
+
+终端 3 运行代理测试：
+
+```bash
+cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
+./proxy_test -M both -a 127.0.0.1 -p 18080 -s "hello proxy" -n 1 -T 3000
+```
+
 ## 配置文件
 
 默认配置文件：
