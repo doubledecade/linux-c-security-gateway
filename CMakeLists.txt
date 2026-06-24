@@ -18,5 +18,13 @@ add_executable(linux_c_security_gateway main.c
 
 configure_file(server.conf server.conf COPYONLY)
 
-target_compile_definitions(linux_c_security_gateway PRIVATE _DEFAULT_SOURCE)
+target_compile_definitions(linux_c_security_gateway PRIVATE
+        _DEFAULT_SOURCE
+        _POSIX_C_SOURCE=200809L
+        _XOPEN_SOURCE=700)
 target_link_libraries(linux_c_security_gateway PRIVATE Threads::Threads)
+
+add_executable(echo_test tools/echo_test.c)
+target_compile_definitions(echo_test PRIVATE
+        _DEFAULT_SOURCE
+        _POSIX_C_SOURCE=200809L)

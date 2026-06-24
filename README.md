@@ -45,6 +45,12 @@ cd /mnt/d/code/linux-c-security-gateway
 
 CMake 会把 `server.conf` 复制到构建目录，因此从 `cmake-build-debug` 目录运行时，默认的 `./server.conf` 可以被正常找到。
 
+如果需要构建 echo 测试工具：
+
+```bash
+/usr/local/bin/cmake --build cmake-build-debug --target echo_test -- -j 4
+```
+
 ## 运行
 
 从构建目录前台运行：
@@ -71,6 +77,64 @@ cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
 ```bash
 ./linux_c_security_gateway -h
 ```
+
+## TCP/UDP Echo 测试工具
+
+`tools/echo_test.c` 用来测试服务端 TCP echo 和 UDP echo 是否正常。默认连接 `127.0.0.1:8080`，并依次测试 TCP 和 UDP。
+
+先启动服务端：
+
+```bash
+cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
+./linux_c_security_gateway
+```
+
+在另一个终端运行默认测试：
+
+```bash
+cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
+./echo_test
+```
+
+默认测试等价于：
+
+```bash
+./echo_test -M both -a 127.0.0.1 -p 8080 -s "hello echo" -n 1 -T 3000
+```
+
+单独测试 TCP echo：
+
+```bash
+./echo_test -M tcp -a 127.0.0.1 -p 8080 -s "hello tcp" -n 3
+```
+
+单独测试 UDP echo：
+
+```bash
+./echo_test -M udp -a 127.0.0.1 -p 8080 -s "hello udp" -n 3
+```
+
+参数说明：
+
+```text
+-M    测试协议：tcp、udp、both，默认 both
+-a    服务端地址，默认 127.0.0.1
+-p    服务端端口，默认 8080
+-s    发送内容，默认 "hello echo"
+-n    测试次数，默认 1
+-T    接收超时时间，单位毫秒，默认 3000
+-h    查看帮助
+```
+
+返回码说明：
+
+```text
+0     测试通过
+1     连接、收发或回显内容校验失败
+2     参数错误
+```
+
+当前 `server.conf` 默认同时监听 `tcp,0.0.0.0,8080,echo` 和 `udp,0.0.0.0,8080,echo`，因此默认测试可以直接覆盖 TCP/UDP echo。
 
 ## 配置文件
 
