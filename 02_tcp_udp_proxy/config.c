@@ -95,6 +95,8 @@ static int add_listener_config(server_config_t *cfg,
                                const char *listen_ip,
                                int listen_port,
                                const char *type,
+                               const char *target_ip,
+                               int target_port,
                                int line_no)
 {
     listener_config_t *listener;
@@ -147,6 +149,38 @@ static int add_listener_config(server_config_t *cfg,
         return -1;
     }
 
+    if (service_type == SERVICE_TYPE_PROXY) {
+        if (target_ip == NULL || target_ip[0] == '\0') {
+            fprintf(stderr,
+                    "config error: proxy listener at line %d requires target ip\n",
+                    line_no);
+            return -1;
+        }
+
+        if (inet_pton(AF_INET, target_ip, &addr) != 1) {
+            fprintf(stderr,
+                    "config error: invalid target ip at line %d: %s\n",
+                    line_no,
+                    target_ip);
+            return -1;
+        }
+
+        if (target_port <= 0 || target_port > 65535) {
+            fprintf(stderr,
+                    "config error: invalid target port at line %d: %d\n",
+                    line_no,
+                    target_port);
+            return -1;
+        }
+    } else {
+        if ((target_ip != NULL && target_ip[0] != '\0') || target_port != 0) {
+            fprintf(stderr,
+                    "config error: echo listener at line %d should not set proxy target\n",
+                    line_no);
+            return -1;
+        }
+    }
+
     listener = &cfg->listeners[cfg->listener_count++];
     listener->proto = proto;
     listener->service_type = service_type;
@@ -154,6 +188,13 @@ static int add_listener_config(server_config_t *cfg,
     snprintf(listener->listen_ip, sizeof(listener->listen_ip), "%s", listen_ip);
     listener->listen_port = listen_port;
     snprintf(listener->type, sizeof(listener->type), "%s", type);
+    if (service_type == SERVICE_TYPE_PROXY) {
+        snprintf(listener->target_ip, sizeof(listener->target_ip), "%s", target_ip);
+        listener->target_port = target_port;
+    } else {
+        listener->target_ip[0] = '\0';
+        listener->target_port = 0;
+    }
 
     return 0;
 }
@@ -165,20 +206,25 @@ static int parse_listener_value(server_config_t *cfg, char *value, int line_no)
     char *listen_ip;
     char *listen_port_text;
     char *type;
+    char *target_ip;
+    char *target_port_text;
     char *extra;
     int listen_port;
+    int target_port = 0;
 
     listen_type = strtok_r(value, ",", &saveptr);
     listen_ip = strtok_r(NULL, ",", &saveptr);
     listen_port_text = strtok_r(NULL, ",", &saveptr);
     type = strtok_r(NULL, ",", &saveptr);
+    target_ip = strtok_r(NULL, ",", &saveptr);
+    target_port_text = strtok_r(NULL, ",", &saveptr);
     extra = strtok_r(NULL, ",", &saveptr);
 
     if (listen_type == NULL || listen_ip == NULL ||
         listen_port_text == NULL || type == NULL || extra != NULL) {
         fprintf(stderr,
                 "config error: listener format at line %d should be "
-                "listener=<listen_type>,<listen_ip>,<listen_port>,<type>\n",
+                "listener=<listen_type>,<listen_ip>,<listen_port>,<type>[,<target_ip>,<target_port>]\n",
                 line_no);
         return -1;
     }
@@ -187,6 +233,13 @@ static int parse_listener_value(server_config_t *cfg, char *value, int line_no)
     listen_ip = trim(listen_ip);
     listen_port_text = trim(listen_port_text);
     type = trim(type);
+    if (target_ip != NULL) {
+        target_ip = trim(target_ip);
+    }
+    if (target_port_text != NULL) {
+        target_port_text = trim(target_port_text);
+        target_port = atoi(target_port_text);
+    }
 
     listen_port = atoi(listen_port_text);
     return add_listener_config(cfg,
@@ -194,6 +247,8 @@ static int parse_listener_value(server_config_t *cfg, char *value, int line_no)
                                listen_ip,
                                listen_port,
                                type,
+                               target_ip,
+                               target_port,
                                line_no);
 }
 
@@ -296,6 +351,8 @@ static int parse_config_file(const char *path, server_config_t *cfg)
                                 legacy_listen_ip,
                                 legacy_listen_port,
                                 "echo",
+                                NULL,
+                                0,
                                 0) == -1) {
             fclose(fp);
             return -1;

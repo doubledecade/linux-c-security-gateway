@@ -17,12 +17,14 @@
 #include <netinet/ip.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <poll.h>
 #include <stdbool.h>
 #include "config.h"
 #include "log.h"
 #define BACKLOG 65535
 #define MAX_EVENTS 1024
 #define IO_BUF_SIZE 4096
+#define UDP_PROXY_TIMEOUT_MS 5000
 #define FILE_PATH_NUMBER_MAX 100
 #define FILE_PATH "./server.conf"
 
@@ -332,6 +334,8 @@ static void task_queue_stop(task_queue_t *q)
 /* ================= 工作线程 ================= */
 
 static int send_all_or_close(int fd, const char *buf, size_t len);
+static void process_tcp_proxy_client(task_t *task);
+static void process_udp_proxy_packet(task_t *task);
 
 static void process_task(task_t *task)
 {
@@ -365,43 +369,48 @@ static void process_task(task_t *task)
             return;
         }
         else{
-            //代理模式
+            process_udp_proxy_packet(task);
             return;
         }
-    }
+    }else if (task->task_type == TASK_TCP_CLIENT)
+    {
+        if (task->channel.service_type==SERVICE_TYPE_ECHO){
+            LOG_INFO("worker handle client: fd=%d, peer=%s, service_type=%d",
+                     fd,
+                     task->peer,
+                     task->channel.service_type);
 
-    LOG_INFO("worker handle client: fd=%d, peer=%s, service_type=%d",
-             fd,
-             task->peer,
-             task->channel.service_type);
+            for (;;) {
+                ssize_t n = recv(fd, buf, sizeof(buf), 0);
 
-    for (;;) {
-        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+                if (n > 0) {
+                    if (send_all_or_close(fd, buf, (size_t)n) == -1) {
+                        break;
+                    }
+                    continue;
+                }
 
-        if (n > 0) {
-            if (send_all_or_close(fd, buf, (size_t)n) == -1) {
+                if (n == 0) {
+                    LOG_INFO("client closed: fd=%d, peer=%s", fd, task->peer);
+                    break;
+                }
+
+                if (errno == EINTR) {
+                    continue;
+                }
+
+                LOG_ERROR("recv failed: fd=%d, peer=%s, errno=%d", fd, task->peer, errno);
                 break;
             }
-            continue;
-        }
 
-        if (n == 0) {
-            LOG_INFO("client closed: fd=%d, peer=%s", fd, task->peer);
-            break;
+            close(fd);
+            task->client_fd = -1;
+        }else
+        {
+            process_tcp_proxy_client(task);
         }
-
-        if (errno == EINTR) {
-            continue;
-        }
-
-        LOG_ERROR("recv failed: fd=%d, peer=%s, errno=%d", fd, task->peer, errno);
-        break;
     }
-
-    close(fd);
-    task->client_fd = -1;
 }
-
 static void *worker_thread(void *arg)
 {
     task_queue_t *q = (task_queue_t *)arg;
@@ -511,7 +520,7 @@ static int send_all_or_close(int fd, const char *buf, size_t len)
             sent += (size_t)n;
             continue;
         }
-
+       //被信号中断，继续发送
         if (n == -1 && errno == EINTR) {
             continue;
         }
@@ -526,6 +535,308 @@ static int send_all_or_close(int fd, const char *buf, size_t len)
     }
 
     return 0;
+}
+
+static int build_proxy_target_addr(const listener_config_t *channel, struct sockaddr_in *target_addr)
+{
+    if (channel == NULL || target_addr == NULL) {
+        return -1;
+    }
+
+    if (channel->target_ip[0] == '\0' ||
+        channel->target_port <= 0 ||
+        channel->target_port > 65535) {
+        LOG_ERROR("invalid proxy target config: ip=%s, port=%d",
+                  channel->target_ip,
+                  channel->target_port);
+        return -1;
+    }
+
+    memset(target_addr, 0, sizeof(*target_addr));
+    target_addr->sin_family = AF_INET;
+    target_addr->sin_port = htons((uint16_t)channel->target_port);
+
+    if (inet_pton(AF_INET, channel->target_ip, &target_addr->sin_addr) != 1) {
+        LOG_ERROR("invalid proxy target ip: %s", channel->target_ip);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int connect_tcp_proxy_target(const listener_config_t *channel)
+{
+    int upstream_fd;
+    int ret;
+    struct sockaddr_in target_addr;
+
+    if (build_proxy_target_addr(channel, &target_addr) == -1) {
+        return -1;
+    }
+
+    upstream_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (upstream_fd == -1) {
+        LOG_ERROR("tcp proxy target socket failed: errno=%d", errno);
+        return -1;
+    }
+
+    do {
+        ret = connect(upstream_fd, (struct sockaddr *)&target_addr, sizeof(target_addr));
+    } while (ret == -1 && errno == EINTR);
+
+    if (ret == -1) {
+        LOG_ERROR("tcp proxy connect target failed: target=%s:%d, errno=%d",
+                  channel->target_ip,
+                  channel->target_port,
+                  errno);
+        close(upstream_fd);
+        return -1;
+    }
+
+    return upstream_fd;
+}
+
+static int relay_proxy_data(int from_fd,
+                            int to_fd,
+                            const char *from_name,
+                            const char *to_name,
+                            const char *peer)
+{
+    char buf[IO_BUF_SIZE];
+
+    for (;;) {
+        ssize_t n = recv(from_fd, buf, sizeof(buf), 0);
+
+        if (n > 0) {
+            if (send_all_or_close(to_fd, buf, (size_t)n) == -1) {
+                LOG_ERROR("tcp proxy send failed: from=%s, to=%s, peer=%s",
+                          from_name,
+                          to_name,
+                          peer);
+                return -1;
+            }
+
+            return 1;
+        }
+
+        if (n == 0) {
+            LOG_INFO("tcp proxy peer closed: side=%s, peer=%s", from_name, peer);
+            return 0;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        LOG_ERROR("tcp proxy recv failed: side=%s, peer=%s, errno=%d",
+                  from_name,
+                  peer,
+                  errno);
+        return -1;
+    }
+}
+
+static int relay_tcp_proxy_streams(int client_fd,
+                                   int upstream_fd,
+                                   const char *peer,
+                                   const listener_config_t *channel)
+{
+    struct pollfd fds[2];
+
+    for (;;) {
+        int ret;
+
+        memset(fds, 0, sizeof(fds));
+        fds[0].fd = client_fd;
+        fds[0].events = POLLIN;
+        fds[1].fd = upstream_fd;
+        fds[1].events = POLLIN;
+
+        ret = poll(fds, 2, -1);
+        if (ret == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            LOG_ERROR("tcp proxy poll failed: peer=%s, target=%s:%d, errno=%d",
+                      peer,
+                      channel->target_ip,
+                      channel->target_port,
+                      errno);
+            return -1;
+        }
+
+        if ((fds[0].revents & POLLIN) != 0) {
+            ret = relay_proxy_data(client_fd, upstream_fd, "client", "target", peer);
+            if (ret <= 0) {
+                return ret;
+            }
+        }
+
+        if ((fds[1].revents & POLLIN) != 0) {
+            ret = relay_proxy_data(upstream_fd, client_fd, "target", "client", peer);
+            if (ret <= 0) {
+                return ret;
+            }
+        }
+
+        if ((fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            LOG_INFO("tcp proxy client event: peer=%s, events=%d", peer, fds[0].revents);
+            return 0;
+        }
+
+        if ((fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            LOG_INFO("tcp proxy target event: peer=%s, target=%s:%d, events=%d",
+                     peer,
+                     channel->target_ip,
+                     channel->target_port,
+                     fds[1].revents);
+            return 0;
+        }
+    }
+}
+
+static void process_tcp_proxy_client(task_t *task)
+{
+    int client_fd = task->client_fd;
+    int upstream_fd;
+
+    LOG_INFO("tcp proxy start: client_fd=%d, peer=%s, target=%s:%d",
+             client_fd,
+             task->peer,
+             task->channel.target_ip,
+             task->channel.target_port);
+
+    upstream_fd = connect_tcp_proxy_target(&task->channel);
+    if (upstream_fd == -1) {
+        close(client_fd);
+        task->client_fd = -1;
+        return;
+    }
+
+    (void)relay_tcp_proxy_streams(client_fd, upstream_fd, task->peer, &task->channel);
+
+    close(upstream_fd);
+    close(client_fd);
+    task->client_fd = -1;
+
+    LOG_INFO("tcp proxy closed: peer=%s, target=%s:%d",
+             task->peer,
+             task->channel.target_ip,
+             task->channel.target_port);
+}
+
+static void process_udp_proxy_packet(task_t *task)
+{
+    int upstream_fd;
+    int ret;
+    char buf[IO_BUF_SIZE];
+    struct sockaddr_in target_addr;
+    struct pollfd pfd;
+    ssize_t n;
+
+    if (build_proxy_target_addr(&task->channel, &target_addr) == -1) {
+        return;
+    }
+
+    upstream_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (upstream_fd == -1) {
+        LOG_ERROR("udp proxy target socket failed: peer=%s, errno=%d",
+                  task->peer,
+                  errno);
+        return;
+    }
+
+    if (connect(upstream_fd, (struct sockaddr *)&target_addr, sizeof(target_addr)) == -1) {
+        LOG_ERROR("udp proxy connect target failed: peer=%s, target=%s:%d, errno=%d",
+                  task->peer,
+                  task->channel.target_ip,
+                  task->channel.target_port,
+                  errno);
+        close(upstream_fd);
+        return;
+    }
+
+    n = send(upstream_fd, task->data, task->data_len, 0);
+    if (n == -1 || n != (ssize_t)task->data_len) {
+        LOG_ERROR("udp proxy send target failed: peer=%s, target=%s:%d, bytes=%zu, sent=%zd, errno=%d",
+                  task->peer,
+                  task->channel.target_ip,
+                  task->channel.target_port,
+                  task->data_len,
+                  n,
+                  errno);
+        close(upstream_fd);
+        return;
+    }
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = upstream_fd;
+    pfd.events = POLLIN;
+
+    do {
+        ret = poll(&pfd, 1, UDP_PROXY_TIMEOUT_MS);
+    } while (ret == -1 && errno == EINTR);
+
+    if (ret == 0) {
+        LOG_WARN("udp proxy target timeout: peer=%s, target=%s:%d",
+                 task->peer,
+                 task->channel.target_ip,
+                 task->channel.target_port);
+        close(upstream_fd);
+        return;
+    }
+
+    if (ret == -1) {
+        LOG_ERROR("udp proxy poll target failed: peer=%s, target=%s:%d, errno=%d",
+                  task->peer,
+                  task->channel.target_ip,
+                  task->channel.target_port,
+                  errno);
+        close(upstream_fd);
+        return;
+    }
+
+    if ((pfd.revents & POLLIN) == 0) {
+        LOG_ERROR("udp proxy target event: peer=%s, target=%s:%d, events=%d",
+                  task->peer,
+                  task->channel.target_ip,
+                  task->channel.target_port,
+                  pfd.revents);
+        close(upstream_fd);
+        return;
+    }
+
+    n = recv(upstream_fd, buf, sizeof(buf), 0);
+    if (n == -1) {
+        LOG_ERROR("udp proxy recv target failed: peer=%s, target=%s:%d, errno=%d",
+                  task->peer,
+                  task->channel.target_ip,
+                  task->channel.target_port,
+                  errno);
+        close(upstream_fd);
+        return;
+    }
+
+    ret = (int)sendto(task->client_fd,
+                      buf,
+                      (size_t)n,
+                      0,
+                      (struct sockaddr *)&task->peer_addr,
+                      task->peer_addr_len);
+    if (ret == -1) {
+        LOG_ERROR("udp proxy send client failed: peer=%s, errno=%d",
+                  task->peer,
+                  errno);
+    } else {
+        LOG_INFO("udp proxy packet handled: peer=%s, target=%s:%d, bytes=%zd",
+                 task->peer,
+                 task->channel.target_ip,
+                 task->channel.target_port,
+                 n);
+    }
+
+    close(upstream_fd);
 }
 
 static void accept_clients(channel_context_t *channel)
@@ -822,13 +1133,15 @@ int main_t(int argc, char *argv[])
     LOG_INFO("program start");
     LOG_INFO("listener_count=%d", cfg.listener_count);
     for (i = 0; i < cfg.listener_count; i++) {
-        LOG_INFO("listener[%d]: listen_type=%s, listen_ip=%s, listen_port=%d, type=%s, service_type=%d",
+        LOG_INFO("listener[%d]: listen_type=%s, listen_ip=%s, listen_port=%d, type=%s, service_type=%d, target=%s:%d",
                  i,
                  cfg.listeners[i].listen_type,
                  cfg.listeners[i].listen_ip,
                  cfg.listeners[i].listen_port,
                  cfg.listeners[i].type,
-                 cfg.listeners[i].service_type);
+                 cfg.listeners[i].service_type,
+                 cfg.listeners[i].target_ip,
+                 cfg.listeners[i].target_port);
     }
     /*
      * 创建 worker 线程。
@@ -903,13 +1216,15 @@ int main_t(int argc, char *argv[])
 
         listen_count++;
 
-        LOG_INFO("listener started: fd=%d, listen_type=%s, ip=%s, port=%d, type=%s, service_type=%d",
+        LOG_INFO("listener started: fd=%d, listen_type=%s, ip=%s, port=%d, type=%s, service_type=%d, target=%s:%d",
                  listen_fd,
                  listener->listen_type,
                  listener->listen_ip,
                  listener->listen_port,
                  listener->type,
-                 listener->service_type);
+                 listener->service_type,
+                 listener->target_ip,
+                 listener->target_port);
     }
 
     if (listen_count == 0) {

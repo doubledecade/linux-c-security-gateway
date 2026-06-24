@@ -26,6 +26,8 @@ typedef struct listener_config {
     char listen_ip[64];
     int listen_port;
     char type[LISTEN_TYPE_NAME_MAX];
+    char target_ip[64];
+    int target_port;
 } listener_config_t;
 
 typedef struct server_config {

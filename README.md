@@ -135,6 +135,7 @@ cd /mnt/d/code/linux-c-security-gateway/cmake-build-debug
 ```
 
 当前 `server.conf` 默认同时监听 `tcp,0.0.0.0,8080,echo` 和 `udp,0.0.0.0,8080,echo`，因此默认测试可以直接覆盖 TCP/UDP echo。
+默认配置还会启动 `tcp,0.0.0.0,18080,proxy,127.0.0.1,8080` 和 `udp,0.0.0.0,18080,proxy,127.0.0.1,8080`，可以用 18080 端口测试 TCP/UDP 代理转发。
 
 ## 配置文件
 
@@ -147,11 +148,22 @@ server.conf
 示例：
 
 ```conf
-listen_ip=0.0.0.0
-listen_port=8080
+# echo:  listener=<listen_type>,<listen_ip>,<listen_port>,echo
+# proxy: listener=<listen_type>,<listen_ip>,<listen_port>,proxy,<target_ip>,<target_port>
+listener=tcp,0.0.0.0,8080,echo
+listener=udp,0.0.0.0,8080,echo
+listener=tcp,0.0.0.0,18080,proxy,127.0.0.1,8080
+listener=udp,0.0.0.0,18080,proxy,127.0.0.1,8080
 worker_num=4
 log_level=info
 log_file=/tmp/myserver.log
+```
+
+`proxy` 模式比 `echo` 模式多两个字段：
+
+```text
+target_ip      代理目标 IPv4 地址
+target_port    代理目标端口，1 到 65535
 ```
 
 支持的日志级别：
