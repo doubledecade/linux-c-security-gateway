@@ -19,12 +19,14 @@
 #include <sys/epoll.h>
 #include <poll.h>
 #include <stdbool.h>
+#include <time.h>
 #include "config.h"
 #include "log.h"
 #define BACKLOG 65535
 #define MAX_EVENTS 1024
 #define IO_BUF_SIZE 4096
 #define UDP_PROXY_TIMEOUT_MS 5000
+#define TCP_CONN_IDLE_TIMEOUT_SEC 60
 #define FILE_PATH_NUMBER_MAX 100
 #define FILE_PATH "./server.conf"
 
@@ -41,8 +43,18 @@ static char file_path[FILE_PATH_NUMBER_MAX] = FILE_PATH;
 static char real_config_path[PATH_MAX];
 static server_config_t cfg;
 
-typedef struct channel_context {
+typedef enum event_context_type {
+    EVENT_CONTEXT_LISTENER = 1,
+    EVENT_CONTEXT_TCP_CONN
+} event_context_type_t;
+
+typedef struct event_context {
+    event_context_type_t event_type;
     int fd;
+} event_context_t;
+
+typedef struct channel_context {
+    event_context_t event;
     listener_config_t config;
 } channel_context_t;
 
@@ -63,6 +75,18 @@ typedef struct task {
     struct task *next;
 } task_t;
 
+typedef struct tcp_conn {
+    event_context_t event;
+    char peer[64];
+    time_t last_active;
+
+    char out_buf[IO_BUF_SIZE];
+    size_t out_len;
+    size_t out_sent;
+    channel_context_t *channel_config;
+    struct tcp_conn *next;
+} tcp_conn_t;
+
 typedef struct task_queue {
     task_t *head;
     task_t *tail;
@@ -73,6 +97,7 @@ typedef struct task_queue {
 } task_queue_t;
 
 static task_queue_t g_queue;
+static tcp_conn_t *g_tcp_conn_head = NULL;
 
 /* ================= 信号处理 ================= */
 
@@ -466,6 +491,22 @@ static int addfd(int epollfd, int fd, uint32_t ev, void *ptr)
     return 0;
 }
 
+static int modfd(int epollfd, int fd, uint32_t ev, void *ptr)
+{
+    struct epoll_event event;
+
+    memset(&event, 0, sizeof(event));
+    event.data.ptr = ptr;
+    event.events = ev;
+
+    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event) == -1) {
+        LOG_ERROR("epoll_ctl mod failed: fd=%d, errno=%d", fd, errno);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int setSocketOpt(int socketHandle, int level, int optname)
 {
     int ret = 0;
@@ -492,6 +533,263 @@ static bool set_nonBlocking(int nfd)
     }
 
     return true;
+}
+
+static int tcp_conn_has_pending_output(const tcp_conn_t *conn)
+{
+    return conn->out_sent < conn->out_len;
+}
+
+static uint32_t tcp_conn_events(const tcp_conn_t *conn)
+{
+    uint32_t events = EPOLLERR | EPOLLHUP;
+
+#ifdef EPOLLRDHUP
+    events |= EPOLLRDHUP;
+#endif
+
+    if (tcp_conn_has_pending_output(conn)) {
+        events |= EPOLLOUT;
+    } else {
+        events |= EPOLLIN;
+    }
+
+    return events;
+}
+
+static int update_tcp_conn_events(int epollfd, tcp_conn_t *conn)
+{
+    return modfd(epollfd, conn->event.fd, tcp_conn_events(conn), conn);
+}
+
+static void tcp_conn_list_add(tcp_conn_t *conn)
+{
+    conn->next = g_tcp_conn_head;
+    g_tcp_conn_head = conn;
+}
+
+static void tcp_conn_list_remove(tcp_conn_t *conn)
+{
+    tcp_conn_t **pp = &g_tcp_conn_head;
+
+    while (*pp != NULL) {
+        if (*pp == conn) {
+            *pp = conn->next;
+            conn->next = NULL;
+            return;
+        }
+
+        pp = &(*pp)->next;
+    }
+}
+
+static void close_tcp_conn(int epollfd, tcp_conn_t *conn, const char *reason)
+{
+    if (conn == NULL) {
+        return;
+    }
+
+    tcp_conn_list_remove(conn);
+
+    if (conn->event.fd >= 0) {
+        if (epollfd >= 0) {
+            epoll_ctl(epollfd, EPOLL_CTL_DEL, conn->event.fd, NULL);
+        }
+
+        LOG_INFO("tcp echo connection closed: fd=%d, peer=%s, reason=%s",
+                 conn->event.fd,
+                 conn->peer,
+                 reason != NULL ? reason : "unknown");
+        close(conn->event.fd);
+        conn->event.fd = -1;
+    }
+
+    free(conn);
+}
+
+static void close_all_tcp_conns(int epollfd)
+{
+    while (g_tcp_conn_head != NULL) {
+        close_tcp_conn(epollfd, g_tcp_conn_head, "server shutdown");
+    }
+}
+
+static void close_idle_tcp_conns(int epollfd)
+{
+    time_t now = time(NULL);
+    tcp_conn_t *conn = g_tcp_conn_head;
+
+    while (conn != NULL) {
+        tcp_conn_t *next = conn->next;
+
+        if (now != (time_t)-1 &&
+            conn->last_active != (time_t)-1 &&
+            now - conn->last_active >= TCP_CONN_IDLE_TIMEOUT_SEC) {
+            close_tcp_conn(epollfd, conn, "idle timeout");
+        }
+
+        conn = next;
+    }
+}
+
+static int flush_tcp_echo_output(int epollfd, tcp_conn_t *conn)
+{
+    while (conn->out_sent < conn->out_len) {
+        ssize_t n = send(conn->event.fd,
+                         conn->out_buf + conn->out_sent,
+                         conn->out_len - conn->out_sent,
+                         MSG_NOSIGNAL);
+
+        if (n > 0) {
+            conn->out_sent += (size_t)n;
+            conn->last_active = time(NULL);
+            continue;
+        }
+
+        if (n == -1 && errno == EINTR) {
+            continue;
+        }
+
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return update_tcp_conn_events(epollfd, conn);
+        }
+
+        LOG_ERROR("tcp echo send failed: fd=%d, peer=%s, errno=%d",
+                  conn->event.fd,
+                  conn->peer,
+                  errno);
+        return -1;
+    }
+
+    conn->out_len = 0;
+    conn->out_sent = 0;
+
+    return update_tcp_conn_events(epollfd, conn);
+}
+
+static int send_or_buffer_tcp_echo(int epollfd, tcp_conn_t *conn, const char *buf, size_t len)
+{
+    size_t sent = 0;
+
+    while (sent < len) {
+        ssize_t n = send(conn->event.fd, buf + sent, len - sent, MSG_NOSIGNAL);
+
+        if (n > 0) {
+            sent += (size_t)n;
+            conn->last_active = time(NULL);
+            continue;
+        }
+
+        if (n == -1 && errno == EINTR) {
+            continue;
+        }
+
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            size_t left = len - sent;
+
+            if (left > sizeof(conn->out_buf)) {
+                LOG_ERROR("tcp echo output buffer too small: fd=%d, peer=%s, left=%zu",
+                          conn->event.fd,
+                          conn->peer,
+                          left);
+                return -1;
+            }
+
+            memcpy(conn->out_buf, buf + sent, left);
+            conn->out_len = left;
+            conn->out_sent = 0;
+            return update_tcp_conn_events(epollfd, conn);
+        }
+
+        LOG_ERROR("tcp echo send failed: fd=%d, peer=%s, errno=%d",
+                  conn->event.fd,
+                  conn->peer,
+                  errno);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int handle_tcp_echo_read(int epollfd, tcp_conn_t *conn)
+{
+    char buf[IO_BUF_SIZE];
+
+    while (!tcp_conn_has_pending_output(conn)) {
+        ssize_t n = recv(conn->event.fd, buf, sizeof(buf), 0);
+
+        if (n > 0) {
+            conn->last_active = time(NULL);
+
+            if (send_or_buffer_tcp_echo(epollfd, conn, buf, (size_t)n) == -1) {
+                return -1;
+            }
+
+            continue;
+        }
+
+        if (n == 0) {
+            return -1;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return update_tcp_conn_events(epollfd, conn);
+        }
+
+        LOG_ERROR("tcp echo recv failed: fd=%d, peer=%s, errno=%d",
+                  conn->event.fd,
+                  conn->peer,
+                  errno);
+        return -1;
+    }
+
+    return update_tcp_conn_events(epollfd, conn);
+}
+
+static void handle_tcp_echo_event(int epollfd, tcp_conn_t *conn, uint32_t event_flags)
+{
+    int peer_closed = 0;
+
+    if (conn == NULL || conn->event.fd < 0) {
+        return;
+    }
+
+    if ((event_flags & EPOLLERR) != 0) {
+        close_tcp_conn(epollfd, conn, "socket error");
+        return;
+    }
+
+#ifdef EPOLLRDHUP
+    if ((event_flags & EPOLLRDHUP) != 0) {
+        peer_closed = 1;
+    }
+#endif
+
+    if ((event_flags & EPOLLHUP) != 0) {
+        peer_closed = 1;
+    }
+
+    if ((event_flags & EPOLLOUT) != 0) {
+        if (flush_tcp_echo_output(epollfd, conn) == -1) {
+            close_tcp_conn(epollfd, conn, "send failed");
+            return;
+        }
+    }
+
+    if ((event_flags & EPOLLIN) != 0) {
+        if (handle_tcp_echo_read(epollfd, conn) == -1) {
+            close_tcp_conn(epollfd, conn, "recv closed or failed");
+            return;
+        }
+    }
+
+    if (peer_closed) {
+        close_tcp_conn(epollfd, conn, "peer closed");
+    }
 }
 
 static bool set_blocking(int nfd)
@@ -839,9 +1137,115 @@ static void process_udp_proxy_packet(task_t *task)
     close(upstream_fd);
 }
 
-static void accept_clients(channel_context_t *channel)
+static int dispatch_tcp_proxy_client(int epoll_fd,channel_context_t *channel,
+                                     int client_fd,
+                                     const struct sockaddr_in *peer_addr)
 {
-    int listen_fd = channel->fd;
+    char peer_ip[INET_ADDRSTRLEN] = {0};
+    tcp_conn_t *conn;
+
+    if (!set_blocking(client_fd)) {
+        LOG_ERROR("set proxy client blocking failed: fd=%d, errno=%d", client_fd, errno);
+        close(client_fd);
+        return -1;
+    }
+
+    if (inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
+        snprintf(peer_ip, sizeof(peer_ip), "unknown");
+    }
+
+    conn = malloc(sizeof(*conn));
+    if (conn == NULL) {
+        LOG_ERROR("malloc proxy client task failed: fd=%d", client_fd);
+        close(client_fd);
+        return -1;
+    }
+
+    memset(conn, 0, sizeof(*conn));
+    conn->event.event_type = EVENT_CONTEXT_TCP_CONN;
+    conn->event.fd = client_fd;
+    conn->last_active = time(NULL);
+    conn->channel_config = channel;
+    if (inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
+        snprintf(peer_ip, sizeof(peer_ip), "unknown");
+    }
+
+    snprintf(conn->peer,
+             sizeof(conn->peer),
+             "%s:%u",
+             peer_ip,
+             (unsigned int)ntohs(peer_addr->sin_port));
+
+    if (addfd(epoll_fd, client_fd, tcp_conn_events(conn), conn) == -1) {
+        close(client_fd);
+        free(conn);
+        return -1;
+    }
+
+    tcp_conn_list_add(conn);
+
+    LOG_INFO("tcp echo client accepted: fd=%d, peer=%s",
+             client_fd,
+             conn->peer);
+
+    return 0;
+}
+
+static int add_tcp_echo_client(int epoll_fd,
+                               channel_context_t *channel,
+                               int client_fd,
+                               const struct sockaddr_in *peer_addr)
+{
+    char peer_ip[INET_ADDRSTRLEN] = {0};
+    tcp_conn_t *conn;
+
+    if (!set_nonBlocking(client_fd)) {
+        LOG_ERROR("set echo client nonblocking failed: fd=%d, errno=%d", client_fd, errno);
+        close(client_fd);
+        return -1;
+    }
+
+    conn = malloc(sizeof(*conn));
+    if (conn == NULL) {
+        LOG_ERROR("malloc tcp_conn_t failed: fd=%d", client_fd);
+        close(client_fd);
+        return -1;
+    }
+
+    memset(conn, 0, sizeof(*conn));
+    conn->event.event_type = EVENT_CONTEXT_TCP_CONN;
+    conn->event.fd = client_fd;
+    conn->last_active = time(NULL);
+    conn->channel_config = channel;
+
+    if (inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
+        snprintf(peer_ip, sizeof(peer_ip), "unknown");
+    }
+
+    snprintf(conn->peer,
+             sizeof(conn->peer),
+             "%s:%u",
+             peer_ip,
+             (unsigned int)ntohs(peer_addr->sin_port));
+
+    if (addfd(epoll_fd, client_fd, tcp_conn_events(conn), conn) == -1) {
+        close(client_fd);
+        free(conn);
+        return -1;
+    }
+
+    tcp_conn_list_add(conn);
+
+    LOG_INFO("tcp echo client accepted: fd=%d, peer=%s",
+             client_fd,
+             conn->peer);
+
+    return 0;
+}
+
+static void accept_clients(channel_context_t *channel, int epoll_fd)
+{
+    int listen_fd = channel->event.fd;
 
     for (;;) {
         struct sockaddr_in peer_addr;
@@ -861,51 +1265,17 @@ static void accept_clients(channel_context_t *channel)
             return;
         }
 
-        if (!set_blocking(client_fd)) {
-            LOG_ERROR("set client blocking failed: fd=%d, errno=%d", client_fd, errno);
-            close(client_fd);
-            continue;
+        if (channel->config.service_type == SERVICE_TYPE_ECHO) {
+            (void)add_tcp_echo_client(epoll_fd, channel, client_fd, &peer_addr);
+        } else {
+            (void)dispatch_tcp_proxy_client(epoll_fd,channel, client_fd, &peer_addr);
         }
-
-        char peer_ip[INET_ADDRSTRLEN] = {0};
-        if (inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
-            snprintf(peer_ip, sizeof(peer_ip), "unknown");
-        }
-
-        task_t *task = malloc(sizeof(*task));
-        if (task == NULL) {
-            LOG_ERROR("malloc client task failed: fd=%d", client_fd);
-            close(client_fd);
-            continue;
-        }
-
-        memset(task, 0, sizeof(*task));
-        task->task_type = TASK_TCP_CLIENT;
-        task->channel = channel->config;
-        task->client_fd = client_fd;
-        task->next = NULL;
-        snprintf(task->peer,
-                 sizeof(task->peer),
-                 "%s:%u",
-                 peer_ip,
-                 (unsigned int)ntohs(peer_addr.sin_port));
-
-        if (task_queue_push(&g_queue, task) == -1) {
-            close(client_fd);
-            free(task);
-            return;
-        }
-
-        LOG_INFO("client dispatched: fd=%d, peer=%s, service_type=%d",
-                 client_fd,
-                 task->peer,
-                 task->channel.service_type);
     }
 }
 
 static void dispatch_udp_packets(channel_context_t *channel)
 {
-    int udp_fd = channel->fd;
+    int udp_fd = channel->event.fd;
 
     for (;;) {
         task_t *task;
@@ -1180,7 +1550,8 @@ int main_t(int argc, char *argv[])
 
     for (i = 0; i < MAX_LISTENERS; i++) {
         memset(&channels[i], 0, sizeof(channels[i]));
-        channels[i].fd = -1;
+        channels[i].event.event_type = EVENT_CONTEXT_LISTENER;
+        channels[i].event.fd = -1;
     }
 
     if (epollfd == -1) {
@@ -1202,7 +1573,8 @@ int main_t(int argc, char *argv[])
             goto quit;
         }
 
-        channels[listen_count].fd = listen_fd;
+        channels[listen_count].event.event_type = EVENT_CONTEXT_LISTENER;
+        channels[listen_count].event.fd = listen_fd;
         channels[listen_count].config = *listener;
 
         if (addfd(epollfd,
@@ -1210,7 +1582,7 @@ int main_t(int argc, char *argv[])
                   EPOLLIN | EPOLLERR | EPOLLHUP,
                   &channels[listen_count]) == -1) {
             close(listen_fd);
-            channels[listen_count].fd = -1;
+            channels[listen_count].event.fd = -1;
             goto quit;
         }
 
@@ -1261,18 +1633,42 @@ int main_t(int argc, char *argv[])
             }
         }
         for(int j =0 ;j<num_events;j++){
-            channel_context_t *channel = (channel_context_t *)events[j].data.ptr;
+            event_context_t *event_context = (event_context_t *)events[j].data.ptr;
             uint32_t event_flags = events[j].events;
 
-            if (channel == NULL || channel->fd < 0) {
+            if (event_context == NULL || event_context->fd < 0) {
                 LOG_WARN("unexpected epoll event: ptr=%p, events=%u",
-                         (void *)channel,
+                         (void *)event_context,
+                         event_flags);
+                continue;
+            }
+            //触发了开始回包
+            if (event_context->event_type == EVENT_CONTEXT_TCP_CONN) {
+                tcp_conn_t *  event_con = (tcp_conn_t *)event_context;
+                if (event_con->channel_config->config.service_type == SERVICE_TYPE_ECHO )
+                {
+                    handle_tcp_echo_event(epollfd, (tcp_conn_t *)event_con, event_flags);
+                }else if (event_con->channel_config->config.service_type == SERVICE_TYPE_PROXY)
+                {
+                    //tcp proxy 直接交给worker处理
+
+                }
+
+                continue;
+            }
+
+            if (event_context->event_type != EVENT_CONTEXT_LISTENER) {
+                LOG_WARN("unknown epoll event type: fd=%d, type=%d, events=%u",
+                         event_context->fd,
+                         event_context->event_type,
                          event_flags);
                 continue;
             }
 
+            channel_context_t *channel = (channel_context_t *)event_context;
+
             if (event_flags & (EPOLLERR | EPOLLHUP)) {
-                LOG_ERROR("listen socket error: fd=%d, events=%u", channel->fd, event_flags);
+                LOG_ERROR("listen socket error: fd=%d, events=%u", channel->event.fd, event_flags);
                 g_stop = 1;
                 break;
             }
@@ -1281,16 +1677,20 @@ int main_t(int argc, char *argv[])
                 if (channel->config.proto == LISTEN_PROTO_UDP) {
                     dispatch_udp_packets(channel);
                 } else {
-                    accept_clients(channel);
+                    accept_clients(channel, epollfd);
                 }
             }
         }
+
+        close_idle_tcp_conns(epollfd);
     }
 quit:
+    close_all_tcp_conns(epollfd);
+
     for (i = 0; i < listen_count; i++) {
-        if (channels[i].fd >= 0) {
-            close(channels[i].fd);
-            channels[i].fd = -1;
+        if (channels[i].event.fd >= 0) {
+            close(channels[i].event.fd);
+            channels[i].event.fd = -1;
         }
     }
 
