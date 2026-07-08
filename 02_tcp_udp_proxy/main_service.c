@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -45,7 +46,8 @@ static server_config_t cfg;
 
 typedef enum event_context_type {
     EVENT_CONTEXT_LISTENER = 1,
-    EVENT_CONTEXT_TCP_CONN
+    EVENT_CONTEXT_TCP_CONN,
+    EVENT_CONTEXT_TCP_UPSTREAM
 } event_context_type_t;
 
 typedef struct event_context {
@@ -83,6 +85,21 @@ typedef struct tcp_conn {
     char out_buf[IO_BUF_SIZE];
     size_t out_len;
     size_t out_sent;
+
+    int upstream_fd;
+    int upstream_connected;
+    int client_closed;
+    int upstream_closed;
+
+    char client_to_upstream_buf[IO_BUF_SIZE];
+    size_t client_to_upstream_len;
+    size_t client_to_upstream_sent;
+
+    char upstream_to_client_buf[IO_BUF_SIZE];
+    size_t upstream_to_client_len;
+    size_t upstream_to_client_sent;
+
+    event_context_t upstream_event;
     channel_context_t *channel_config;
     struct tcp_conn *next;
 } tcp_conn_t;
@@ -98,6 +115,8 @@ typedef struct task_queue {
 
 static task_queue_t g_queue;
 static tcp_conn_t *g_tcp_conn_head = NULL;
+static tcp_conn_t *g_tcp_conn_free_head = NULL;
+static int g_defer_tcp_conn_free = 0;
 
 /* ================= 信号处理 ================= */
 
@@ -583,6 +602,27 @@ static void tcp_conn_list_remove(tcp_conn_t *conn)
     }
 }
 
+static void free_deferred_tcp_conns(void)
+{
+    while (g_tcp_conn_free_head != NULL) {
+        tcp_conn_t *conn = g_tcp_conn_free_head;
+
+        g_tcp_conn_free_head = conn->next;
+        free(conn);
+    }
+}
+
+static void release_tcp_conn(tcp_conn_t *conn)
+{
+    if (g_defer_tcp_conn_free) {
+        conn->next = g_tcp_conn_free_head;
+        g_tcp_conn_free_head = conn;
+        return;
+    }
+
+    free(conn);
+}
+
 static void close_tcp_conn(int epollfd, tcp_conn_t *conn, const char *reason)
 {
     if (conn == NULL) {
@@ -596,7 +636,7 @@ static void close_tcp_conn(int epollfd, tcp_conn_t *conn, const char *reason)
             epoll_ctl(epollfd, EPOLL_CTL_DEL, conn->event.fd, NULL);
         }
 
-        LOG_INFO("tcp echo connection closed: fd=%d, peer=%s, reason=%s",
+        LOG_INFO("tcp connection closed: fd=%d, peer=%s, reason=%s",
                  conn->event.fd,
                  conn->peer,
                  reason != NULL ? reason : "unknown");
@@ -604,7 +644,23 @@ static void close_tcp_conn(int epollfd, tcp_conn_t *conn, const char *reason)
         conn->event.fd = -1;
     }
 
-    free(conn);
+    if (conn->upstream_fd >= 0) {
+        if (epollfd >= 0) {
+            epoll_ctl(epollfd, EPOLL_CTL_DEL, conn->upstream_fd, NULL);
+        }
+
+        LOG_INFO("tcp proxy upstream closed: fd=%d, peer=%s, target=%s:%d, reason=%s",
+                 conn->upstream_fd,
+                 conn->peer,
+                 conn->channel_config != NULL ? conn->channel_config->config.target_ip : "",
+                 conn->channel_config != NULL ? conn->channel_config->config.target_port : 0,
+                 reason != NULL ? reason : "unknown");
+        close(conn->upstream_fd);
+        conn->upstream_fd = -1;
+        conn->upstream_event.fd = -1;
+    }
+
+    release_tcp_conn(conn);
 }
 
 static void close_all_tcp_conns(int epollfd)
@@ -645,7 +701,7 @@ static int flush_tcp_echo_output(int epollfd, tcp_conn_t *conn)
             conn->last_active = time(NULL);
             continue;
         }
-
+       //表示被某个信号中断
         if (n == -1 && errno == EINTR) {
             continue;
         }
@@ -757,7 +813,14 @@ static void handle_tcp_echo_event(int epollfd, tcp_conn_t *conn, uint32_t event_
     if (conn == NULL || conn->event.fd < 0) {
         return;
     }
-
+    //如果这个 TCP socket 出现了底层错误，就关闭这个连接并停止继续处理本次事件。
+    /*
+    TCP 连接异常断开
+    socket 出现异步错误
+    对端 reset 连接
+    之前的非阻塞连接失败
+    fd 状态已经不适合继续读写
+     */
     if ((event_flags & EPOLLERR) != 0) {
         close_tcp_conn(epollfd, conn, "socket error");
         return;
@@ -860,6 +923,397 @@ static int build_proxy_target_addr(const listener_config_t *channel, struct sock
     }
 
     return 0;
+}
+
+static int create_tcp_fd(const listener_config_t *channel, int *connected)
+{
+    int fd;
+    int ret;
+    struct sockaddr_in target_addr;
+
+    if (connected != NULL) {
+        *connected = 0;
+    }
+
+    if (build_proxy_target_addr(channel, &target_addr) == -1) {
+        return -1;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == -1) {
+        LOG_ERROR("tcp proxy target socket failed: errno=%d", errno);
+        return -1;
+    }
+
+    if (!set_nonBlocking(fd)) {
+        LOG_ERROR("set proxy target nonblocking failed: fd=%d, errno=%d", fd, errno);
+        close(fd);
+        return -1;
+    }
+
+    do {
+        ret = connect(fd, (struct sockaddr *)&target_addr, sizeof(target_addr));
+    } while (ret == -1 && errno == EINTR);
+
+    if (ret == 0) {
+        if (connected != NULL) {
+            *connected = 1;
+        }
+        return fd;
+    }
+
+    if (errno == EINPROGRESS) {
+        return fd;
+    }
+
+    LOG_ERROR("tcp proxy connect target failed: target=%s:%d, errno=%d",
+              channel->target_ip,
+              channel->target_port,
+              errno);
+    close(fd);
+    return -1;
+}
+
+static tcp_conn_t *tcp_conn_from_event_context(event_context_t *event_context)
+{
+    if (event_context->event_type == EVENT_CONTEXT_TCP_CONN) {
+        return (tcp_conn_t *)event_context;
+    }
+
+    if (event_context->event_type == EVENT_CONTEXT_TCP_UPSTREAM) {
+        return (tcp_conn_t *)((char *)event_context - offsetof(tcp_conn_t, upstream_event));
+    }
+
+    return NULL;
+}
+
+static int tcp_proxy_has_client_to_upstream_output(const tcp_conn_t *conn)
+{
+    return conn->client_to_upstream_sent < conn->client_to_upstream_len;
+}
+
+static int tcp_proxy_has_upstream_to_client_output(const tcp_conn_t *conn)
+{
+    return conn->upstream_to_client_sent < conn->upstream_to_client_len;
+}
+
+static uint32_t tcp_proxy_client_events(const tcp_conn_t *conn)
+{
+    uint32_t events = EPOLLERR | EPOLLHUP;
+
+#ifdef EPOLLRDHUP
+    events |= EPOLLRDHUP;
+#endif
+
+    if (!conn->client_closed &&
+        conn->upstream_connected &&
+        !tcp_proxy_has_client_to_upstream_output(conn)) {
+        events |= EPOLLIN;
+    }
+
+    if (tcp_proxy_has_upstream_to_client_output(conn)) {
+        events |= EPOLLOUT;
+    }
+
+    return events;
+}
+
+static uint32_t tcp_proxy_upstream_events(const tcp_conn_t *conn)
+{
+    uint32_t events = EPOLLERR | EPOLLHUP;
+
+#ifdef EPOLLRDHUP
+    events |= EPOLLRDHUP;
+#endif
+
+    if (!conn->upstream_connected) {
+        events |= EPOLLOUT;
+        return events;
+    }
+
+    if (!conn->upstream_closed &&
+        !tcp_proxy_has_upstream_to_client_output(conn)) {
+        events |= EPOLLIN;
+    }
+
+    if (tcp_proxy_has_client_to_upstream_output(conn)) {
+        events |= EPOLLOUT;
+    }
+
+    return events;
+}
+
+static int update_tcp_proxy_events(int epollfd, tcp_conn_t *conn)
+{
+    if (modfd(epollfd,
+              conn->event.fd,
+              tcp_proxy_client_events(conn),
+              &conn->event) == -1) {
+        return -1;
+    }
+
+    if (modfd(epollfd,
+              conn->upstream_fd,
+              tcp_proxy_upstream_events(conn),
+              &conn->upstream_event) == -1) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int finish_tcp_proxy_connect(tcp_conn_t *conn)
+{
+    int err = 0;
+    socklen_t err_len = sizeof(err);
+
+    if (getsockopt(conn->upstream_fd, SOL_SOCKET, SO_ERROR, &err, &err_len) == -1) {
+        LOG_ERROR("tcp proxy getsockopt failed: peer=%s, target=%s:%d, errno=%d",
+                  conn->peer,
+                  conn->channel_config->config.target_ip,
+                  conn->channel_config->config.target_port,
+                  errno);
+        return -1;
+    }
+
+    if (err != 0) {
+        LOG_ERROR("tcp proxy connect target failed: peer=%s, target=%s:%d, errno=%d",
+                  conn->peer,
+                  conn->channel_config->config.target_ip,
+                  conn->channel_config->config.target_port,
+                  err);
+        return -1;
+    }
+
+    conn->upstream_connected = 1;
+    conn->last_active = time(NULL);
+
+    LOG_INFO("tcp proxy target connected: peer=%s, target=%s:%d",
+             conn->peer,
+             conn->channel_config->config.target_ip,
+             conn->channel_config->config.target_port);
+
+    return 0;
+}
+
+static int flush_tcp_proxy_output(tcp_conn_t *conn, int to_upstream)
+{
+    int fd;
+    char *buf;
+    size_t *len;
+    size_t *sent;
+    const char *to_name;
+
+    if (to_upstream) {
+        if (!conn->upstream_connected) {
+            return 0;
+        }
+
+        fd = conn->upstream_fd;
+        buf = conn->client_to_upstream_buf;
+        len = &conn->client_to_upstream_len;
+        sent = &conn->client_to_upstream_sent;
+        to_name = "target";
+    } else {
+        fd = conn->event.fd;
+        buf = conn->upstream_to_client_buf;
+        len = &conn->upstream_to_client_len;
+        sent = &conn->upstream_to_client_sent;
+        to_name = "client";
+    }
+
+    while (*sent < *len) {
+        ssize_t n = send(fd, buf + *sent, *len - *sent, MSG_NOSIGNAL);
+
+        if (n > 0) {
+            *sent += (size_t)n;
+            conn->last_active = time(NULL);
+            continue;
+        }
+
+        if (n == -1 && errno == EINTR) {
+            continue;
+        }
+
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        }
+
+        LOG_ERROR("tcp proxy send failed: peer=%s, to=%s, errno=%d",
+                  conn->peer,
+                  to_name,
+                  errno);
+        return -1;
+    }
+
+    *len = 0;
+    *sent = 0;
+    return 0;
+}
+
+static int read_tcp_proxy_input(tcp_conn_t *conn, int from_client)
+{
+    int fd;
+    char *buf;
+    size_t *len;
+    size_t *sent;
+    const char *from_name;
+
+    if (from_client) {
+        if (!conn->upstream_connected) {
+            return 0;
+        }
+
+        fd = conn->event.fd;
+        buf = conn->client_to_upstream_buf;
+        len = &conn->client_to_upstream_len;
+        sent = &conn->client_to_upstream_sent;
+        from_name = "client";
+    } else {
+        fd = conn->upstream_fd;
+        buf = conn->upstream_to_client_buf;
+        len = &conn->upstream_to_client_len;
+        sent = &conn->upstream_to_client_sent;
+        from_name = "target";
+    }
+
+    if (*sent < *len) {
+        return 0;
+    }
+
+    *len = 0;
+    *sent = 0;
+
+    for (;;) {
+        ssize_t n = recv(fd, buf, IO_BUF_SIZE, 0);
+
+        if (n > 0) {
+            *len = (size_t)n;
+            *sent = 0;
+            conn->last_active = time(NULL);
+            return 0;
+        }
+
+        if (n == 0) {
+            LOG_INFO("tcp proxy peer closed: side=%s, peer=%s",
+                     from_name,
+                     conn->peer);
+            return 1;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+
+        LOG_ERROR("tcp proxy recv failed: side=%s, peer=%s, errno=%d",
+                  from_name,
+                  conn->peer,
+                  errno);
+        return -1;
+    }
+}
+
+static void handle_tcp_proxy_event(int epollfd,
+                                   tcp_conn_t *conn,
+                                   int event_fd,
+                                   uint32_t event_flags)
+{
+    int is_client;
+    int is_upstream;
+    int peer_closed = 0;
+
+    if (conn == NULL || conn->event.fd < 0 || conn->upstream_fd < 0) {
+        return;
+    }
+
+    is_client = (event_fd == conn->event.fd);
+    is_upstream = (event_fd == conn->upstream_fd);
+
+    if (!is_client && !is_upstream) {
+        close_tcp_conn(epollfd, conn, "unexpected proxy event fd");
+        return;
+    }
+
+    if (is_upstream &&
+        !conn->upstream_connected &&
+        (event_flags & (EPOLLOUT | EPOLLERR | EPOLLHUP)) != 0) {
+        if (finish_tcp_proxy_connect(conn) == -1) {
+            close_tcp_conn(epollfd, conn, "connect target failed");
+            return;
+        }
+
+        event_flags &= ~EPOLLOUT;
+    }
+
+    if ((event_flags & EPOLLERR) != 0) {
+        close_tcp_conn(epollfd, conn, "socket error");
+        return;
+    }
+
+#ifdef EPOLLRDHUP
+    if ((event_flags & EPOLLRDHUP) != 0) {
+        peer_closed = 1;
+    }
+#endif
+
+    if ((event_flags & EPOLLHUP) != 0) {
+        peer_closed = 1;
+    }
+
+    if (is_client) {
+        if ((event_flags & EPOLLOUT) != 0) {
+            if (flush_tcp_proxy_output(conn, 0) == -1) {
+                close_tcp_conn(epollfd, conn, "send client failed");
+                return;
+            }
+        }
+
+        if ((event_flags & EPOLLIN) != 0) {
+            int ret = read_tcp_proxy_input(conn, 1);
+
+            if (ret == -1) {
+                close_tcp_conn(epollfd, conn, "recv client failed");
+                return;
+            }
+
+            if (ret == 1) {
+                peer_closed = 1;
+            }
+        }
+    } else {
+        if ((event_flags & EPOLLOUT) != 0) {
+            if (flush_tcp_proxy_output(conn, 1) == -1) {
+                close_tcp_conn(epollfd, conn, "send target failed");
+                return;
+            }
+        }
+
+        if ((event_flags & EPOLLIN) != 0) {
+            int ret = read_tcp_proxy_input(conn, 0);
+
+            if (ret == -1) {
+                close_tcp_conn(epollfd, conn, "recv target failed");
+                return;
+            }
+
+            if (ret == 1) {
+                peer_closed = 1;
+            }
+        }
+    }
+
+    if (peer_closed) {
+        close_tcp_conn(epollfd, conn, "peer closed");
+        return;
+    }
+
+    if (update_tcp_proxy_events(epollfd, conn) == -1) {
+        close_tcp_conn(epollfd, conn, "update events failed");
+    }
 }
 
 static int connect_tcp_proxy_target(const listener_config_t *channel)
@@ -1143,20 +1597,25 @@ static int dispatch_tcp_proxy_client(int epoll_fd,channel_context_t *channel,
 {
     char peer_ip[INET_ADDRSTRLEN] = {0};
     tcp_conn_t *conn;
+    int connected = 0;
+    int upstream_fd;
 
-    if (!set_blocking(client_fd)) {
-        LOG_ERROR("set proxy client blocking failed: fd=%d, errno=%d", client_fd, errno);
+    if (!set_nonBlocking(client_fd)) {
+        LOG_ERROR("set proxy client nonblocking failed: fd=%d, errno=%d", client_fd, errno);
         close(client_fd);
         return -1;
     }
 
-    if (inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
-        snprintf(peer_ip, sizeof(peer_ip), "unknown");
+    upstream_fd = create_tcp_fd(&channel->config, &connected);
+    if (upstream_fd == -1) {
+        close(client_fd);
+        return -1;
     }
 
     conn = malloc(sizeof(*conn));
     if (conn == NULL) {
-        LOG_ERROR("malloc proxy client task failed: fd=%d", client_fd);
+        LOG_ERROR("malloc proxy tcp_conn_t failed: fd=%d", client_fd);
+        close(upstream_fd);
         close(client_fd);
         return -1;
     }
@@ -1164,8 +1623,13 @@ static int dispatch_tcp_proxy_client(int epoll_fd,channel_context_t *channel,
     memset(conn, 0, sizeof(*conn));
     conn->event.event_type = EVENT_CONTEXT_TCP_CONN;
     conn->event.fd = client_fd;
+    conn->upstream_event.event_type = EVENT_CONTEXT_TCP_UPSTREAM;
+    conn->upstream_event.fd = upstream_fd;
+    conn->upstream_fd = upstream_fd;
+    conn->upstream_connected = connected;
     conn->last_active = time(NULL);
     conn->channel_config = channel;
+
     if (inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
         snprintf(peer_ip, sizeof(peer_ip), "unknown");
     }
@@ -1176,17 +1640,29 @@ static int dispatch_tcp_proxy_client(int epoll_fd,channel_context_t *channel,
              peer_ip,
              (unsigned int)ntohs(peer_addr->sin_port));
 
-    if (addfd(epoll_fd, client_fd, tcp_conn_events(conn), conn) == -1) {
-        close(client_fd);
-        free(conn);
+    if (addfd(epoll_fd,
+              client_fd,
+              tcp_proxy_client_events(conn),
+              &conn->event) == -1) {
+        close_tcp_conn(epoll_fd, conn, "add client fd failed");
+        return -1;
+    }
+
+    if (addfd(epoll_fd,
+              upstream_fd,
+              tcp_proxy_upstream_events(conn),
+              &conn->upstream_event) == -1) {
+        close_tcp_conn(epoll_fd, conn, "add upstream fd failed");
         return -1;
     }
 
     tcp_conn_list_add(conn);
 
-    LOG_INFO("tcp echo client accepted: fd=%d, peer=%s",
+    LOG_INFO("tcp proxy client accepted: fd=%d, peer=%s, target=%s:%d",
              client_fd,
-             conn->peer);
+             conn->peer,
+             channel->config.target_ip,
+             channel->config.target_port);
 
     return 0;
 }
@@ -1215,6 +1691,8 @@ static int add_tcp_echo_client(int epoll_fd,
     memset(conn, 0, sizeof(*conn));
     conn->event.event_type = EVENT_CONTEXT_TCP_CONN;
     conn->event.fd = client_fd;
+    conn->upstream_fd = -1;
+    conn->upstream_event.fd = -1;
     conn->last_active = time(NULL);
     conn->channel_config = channel;
 
@@ -1256,7 +1734,7 @@ static void accept_clients(channel_context_t *channel, int epoll_fd)
             if (errno == EINTR) {
                 continue;
             }
-
+            //监听 socket 是非阻塞的，当前已没有等待接收的新连接了
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             }
@@ -1632,6 +2110,7 @@ int main_t(int argc, char *argv[])
                 continue;
             }
         }
+        g_defer_tcp_conn_free = 1;
         for(int j =0 ;j<num_events;j++){
             event_context_t *event_context = (event_context_t *)events[j].data.ptr;
             uint32_t event_flags = events[j].events;
@@ -1643,15 +2122,27 @@ int main_t(int argc, char *argv[])
                 continue;
             }
             //触发了开始回包
-            if (event_context->event_type == EVENT_CONTEXT_TCP_CONN) {
-                tcp_conn_t *  event_con = (tcp_conn_t *)event_context;
+            if (event_context->event_type == EVENT_CONTEXT_TCP_CONN ||
+                event_context->event_type == EVENT_CONTEXT_TCP_UPSTREAM) {
+                tcp_conn_t *event_con = tcp_conn_from_event_context(event_context);
+
+                if (event_con == NULL || event_con->channel_config == NULL) {
+                    LOG_WARN("unexpected tcp event context: ptr=%p, events=%u",
+                             (void *)event_context,
+                             event_flags);
+                    continue;
+                }
                 if (event_con->channel_config->config.service_type == SERVICE_TYPE_ECHO )
                 {
+                    if (event_context->event_type != EVENT_CONTEXT_TCP_CONN) {
+                        close_tcp_conn(epollfd, event_con, "unexpected echo upstream event");
+                        continue;
+                    }
+
                     handle_tcp_echo_event(epollfd, (tcp_conn_t *)event_con, event_flags);
                 }else if (event_con->channel_config->config.service_type == SERVICE_TYPE_PROXY)
                 {
-                    //tcp proxy 直接交给worker处理
-
+                    handle_tcp_proxy_event(epollfd, event_con, event_context->fd, event_flags);
                 }
 
                 continue;
@@ -1681,10 +2172,14 @@ int main_t(int argc, char *argv[])
                 }
             }
         }
+        g_defer_tcp_conn_free = 0;
+        free_deferred_tcp_conns();
 
         close_idle_tcp_conns(epollfd);
     }
 quit:
+    g_defer_tcp_conn_free = 0;
+    free_deferred_tcp_conns();
     close_all_tcp_conns(epollfd);
 
     for (i = 0; i < listen_count; i++) {
