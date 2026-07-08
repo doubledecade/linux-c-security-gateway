@@ -387,35 +387,16 @@ static void process_task(task_t *task)
     int fd = task->client_fd;
 
     if (task->task_type == TASK_UDP_PACKET) {
-        if(task->channel.service_type==SERVICE_TYPE_ECHO) {
-            LOG_INFO("worker handle udp packet: fd=%d, peer=%s, service_type=%d",
-                     fd,
-                     task->peer,
-                     task->channel.service_type);
-
-            ssize_t n = sendto(fd,
-                               task->data,
-                               task->data_len,
-                               0,
-                               (struct sockaddr *) &task->peer_addr,
-                               task->peer_addr_len);
-            if (n == -1) {
-                LOG_ERROR("udp sendto failed: fd=%d, peer=%s, errno=%d",
-                          fd,
-                          task->peer,
-                          errno);
-            } else {
-                LOG_INFO("udp packet handled: fd=%d, peer=%s, bytes=%zd",
-                         fd,
-                         task->peer,
-                         n);
-            }
-            return;
-        }
-        else{
+        if (task->channel.service_type == SERVICE_TYPE_PROXY) {
             process_udp_proxy_packet(task);
             return;
         }
+
+        LOG_WARN("unexpected udp task service_type: fd=%d, peer=%s, service_type=%d",
+                 fd,
+                 task->peer,
+                 task->channel.service_type);
+        return;
     }else if (task->task_type == TASK_TCP_CLIENT)
     {
         if (task->channel.service_type==SERVICE_TYPE_ECHO){
@@ -1751,6 +1732,70 @@ static void accept_clients(channel_context_t *channel, int epoll_fd)
     }
 }
 
+static void handle_udp_echo_packets(channel_context_t *channel)
+{
+    int udp_fd = channel->event.fd;
+    char buf[IO_BUF_SIZE];
+
+    for (;;) {
+        char peer_ip[INET_ADDRSTRLEN] = {0};
+        char peer[64];
+        struct sockaddr_in peer_addr;
+        socklen_t peer_len = sizeof(peer_addr);
+        ssize_t n;
+        ssize_t sent;
+
+        n = recvfrom(udp_fd,
+                     buf,
+                     sizeof(buf),
+                     0,
+                     (struct sockaddr *)&peer_addr,
+                     &peer_len);
+
+        if (n == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+
+            LOG_ERROR("udp echo recvfrom failed: fd=%d, errno=%d", udp_fd, errno);
+            return;
+        }
+
+        if (inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
+            snprintf(peer_ip, sizeof(peer_ip), "unknown");
+        }
+
+        snprintf(peer,
+                 sizeof(peer),
+                 "%s:%u",
+                 peer_ip,
+                 (unsigned int)ntohs(peer_addr.sin_port));
+
+        sent = sendto(udp_fd,
+                      buf,
+                      (size_t)n,
+                      0,
+                      (struct sockaddr *)&peer_addr,
+                      peer_len);
+        if (sent == -1) {
+            LOG_ERROR("udp echo sendto failed: fd=%d, peer=%s, errno=%d",
+                      udp_fd,
+                      peer,
+                      errno);
+            continue;
+        }
+
+        LOG_INFO("udp echo packet handled: fd=%d, peer=%s, bytes=%zd",
+                 udp_fd,
+                 peer,
+                 sent);
+    }
+}
+
 static void dispatch_udp_packets(channel_context_t *channel)
 {
     int udp_fd = channel->event.fd;
@@ -2166,7 +2211,11 @@ int main_t(int argc, char *argv[])
 
             if (event_flags & EPOLLIN) {
                 if (channel->config.proto == LISTEN_PROTO_UDP) {
-                    dispatch_udp_packets(channel);
+                    if (channel->config.service_type == SERVICE_TYPE_ECHO) {
+                        handle_udp_echo_packets(channel);
+                    } else {
+                        dispatch_udp_packets(channel);
+                    }
                 } else {
                     accept_clients(channel, epollfd);
                 }
