@@ -27,6 +27,7 @@
 #define MAX_EVENTS 1024
 #define IO_BUF_SIZE 4096
 #define UDP_PROXY_TIMEOUT_MS 5000
+#define UDP_PROXY_TIMEOUT_SEC ((UDP_PROXY_TIMEOUT_MS + 999) / 1000)
 #define TCP_CONN_IDLE_TIMEOUT_SEC 60
 #define FILE_PATH_NUMBER_MAX 100
 #define FILE_PATH "./server.conf"
@@ -47,7 +48,8 @@ static server_config_t cfg;
 typedef enum event_context_type {
     EVENT_CONTEXT_LISTENER = 1,
     EVENT_CONTEXT_TCP_CONN,
-    EVENT_CONTEXT_TCP_UPSTREAM
+    EVENT_CONTEXT_TCP_UPSTREAM,
+    EVENT_CONTEXT_UDP_UPSTREAM
 } event_context_type_t;
 
 typedef struct event_context {
@@ -61,8 +63,7 @@ typedef struct channel_context {
 } channel_context_t;
 
 typedef enum task_type {
-    TASK_TCP_CLIENT = 0,
-    TASK_UDP_PACKET
+    TASK_TCP_CLIENT = 0
 } task_type_t;
 
 typedef struct task {
@@ -104,6 +105,20 @@ typedef struct tcp_conn {
     struct tcp_conn *next;
 } tcp_conn_t;
 
+typedef struct udp_proxy_request {
+    event_context_t event;
+    int client_fd;
+    listener_config_t channel;
+    char peer[64];
+    struct sockaddr_in peer_addr;
+    socklen_t peer_addr_len;
+    char data[IO_BUF_SIZE];
+    size_t data_len;
+    int request_sent;
+    time_t created_at;
+    struct udp_proxy_request *next;
+} udp_proxy_request_t;
+
 typedef struct task_queue {
     task_t *head;
     task_t *tail;
@@ -116,6 +131,7 @@ typedef struct task_queue {
 static task_queue_t g_queue;
 static tcp_conn_t *g_tcp_conn_head = NULL;
 static tcp_conn_t *g_tcp_conn_free_head = NULL;
+static udp_proxy_request_t *g_udp_proxy_head = NULL;
 static int g_defer_tcp_conn_free = 0;
 
 /* ================= 信号处理 ================= */
@@ -379,25 +395,13 @@ static void task_queue_stop(task_queue_t *q)
 
 static int send_all_or_close(int fd, const char *buf, size_t len);
 static void process_tcp_proxy_client(task_t *task);
-static void process_udp_proxy_packet(task_t *task);
 
 static void process_task(task_t *task)
 {
     char buf[IO_BUF_SIZE];
     int fd = task->client_fd;
 
-    if (task->task_type == TASK_UDP_PACKET) {
-        if (task->channel.service_type == SERVICE_TYPE_PROXY) {
-            process_udp_proxy_packet(task);
-            return;
-        }
-
-        LOG_WARN("unexpected udp task service_type: fd=%d, peer=%s, service_type=%d",
-                 fd,
-                 task->peer,
-                 task->channel.service_type);
-        return;
-    }else if (task->task_type == TASK_TCP_CLIENT)
+    if (task->task_type == TASK_TCP_CLIENT)
     {
         if (task->channel.service_type==SERVICE_TYPE_ECHO){
             LOG_INFO("worker handle client: fd=%d, peer=%s, service_type=%d",
@@ -904,6 +908,318 @@ static int build_proxy_target_addr(const listener_config_t *channel, struct sock
     }
 
     return 0;
+}
+
+static void udp_proxy_list_add(udp_proxy_request_t *req)
+{
+    req->next = g_udp_proxy_head;
+    g_udp_proxy_head = req;
+}
+
+static void udp_proxy_list_remove(udp_proxy_request_t *req)
+{
+    udp_proxy_request_t **pp = &g_udp_proxy_head;
+
+    while (*pp != NULL) {
+        if (*pp == req) {
+            *pp = req->next;
+            req->next = NULL;
+            return;
+        }
+
+        pp = &(*pp)->next;
+    }
+}
+
+static uint32_t udp_proxy_events(const udp_proxy_request_t *req)
+{
+    uint32_t events = EPOLLERR | EPOLLHUP;
+
+    if (req->request_sent) {
+        events |= EPOLLIN;
+    } else {
+        events |= EPOLLOUT;
+    }
+
+    return events;
+}
+
+static void close_udp_proxy_request(int epollfd,
+                                    udp_proxy_request_t *req,
+                                    const char *reason)
+{
+    if (req == NULL) {
+        return;
+    }
+
+    udp_proxy_list_remove(req);
+
+    if (req->event.fd >= 0) {
+        if (epollfd >= 0) {
+            epoll_ctl(epollfd, EPOLL_CTL_DEL, req->event.fd, NULL);
+        }
+
+        LOG_INFO("udp proxy request closed: fd=%d, peer=%s, target=%s:%d, reason=%s",
+                 req->event.fd,
+                 req->peer,
+                 req->channel.target_ip,
+                 req->channel.target_port,
+                 reason != NULL ? reason : "unknown");
+        close(req->event.fd);
+        req->event.fd = -1;
+    }
+
+    free(req);
+}
+
+static void close_all_udp_proxy_requests(int epollfd)
+{
+    while (g_udp_proxy_head != NULL) {
+        close_udp_proxy_request(epollfd, g_udp_proxy_head, "server shutdown");
+    }
+}
+
+static void close_expired_udp_proxy_requests(int epollfd)
+{
+    time_t now = time(NULL);
+    udp_proxy_request_t *req = g_udp_proxy_head;
+
+    if (now == (time_t)-1) {
+        return;
+    }
+
+    while (req != NULL) {
+        udp_proxy_request_t *next = req->next;
+
+        if (req->created_at != (time_t)-1 &&
+            now - req->created_at >= UDP_PROXY_TIMEOUT_SEC) {
+            LOG_WARN("udp proxy target timeout: peer=%s, target=%s:%d",
+                     req->peer,
+                     req->channel.target_ip,
+                     req->channel.target_port);
+            close_udp_proxy_request(epollfd, req, "target timeout");
+        }
+
+        req = next;
+    }
+}
+
+static int flush_udp_proxy_request(udp_proxy_request_t *req)
+{
+    ssize_t n;
+
+    if (req->request_sent) {
+        return 1;
+    }
+
+    do {
+        n = send(req->event.fd, req->data, req->data_len, 0);
+    } while (n == -1 && errno == EINTR);
+
+    if (n == (ssize_t)req->data_len) {
+        req->request_sent = 1;
+        return 1;
+    }
+
+    if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return 0;
+    }
+
+    LOG_ERROR("udp proxy send target failed: peer=%s, target=%s:%d, bytes=%zu, sent=%zd, errno=%d",
+              req->peer,
+              req->channel.target_ip,
+              req->channel.target_port,
+              req->data_len,
+              n,
+              n == -1 ? errno : 0);
+    return -1;
+}
+
+static int start_udp_proxy_request(int epollfd,
+                                   channel_context_t *channel,
+                                   int client_fd,
+                                   const struct sockaddr_in *peer_addr,
+                                   socklen_t peer_addr_len,
+                                   const char *peer,
+                                   const char *data,
+                                   size_t data_len)
+{
+    int upstream_fd;
+    int ret;
+    struct sockaddr_in target_addr;
+    udp_proxy_request_t *req;
+
+    if (peer_addr == NULL || peer == NULL || data == NULL || data_len > IO_BUF_SIZE) {
+        LOG_ERROR("invalid udp proxy request input: peer=%s, bytes=%zu",
+                  peer != NULL ? peer : "",
+                  data_len);
+        return -1;
+    }
+
+    if (build_proxy_target_addr(&channel->config, &target_addr) == -1) {
+        return -1;
+    }
+
+    upstream_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (upstream_fd == -1) {
+        LOG_ERROR("udp proxy target socket failed: peer=%s, errno=%d",
+                  peer,
+                  errno);
+        return -1;
+    }
+
+    if (!set_nonBlocking(upstream_fd)) {
+        LOG_ERROR("set udp proxy target nonblocking failed: peer=%s, fd=%d, errno=%d",
+                  peer,
+                  upstream_fd,
+                  errno);
+        close(upstream_fd);
+        return -1;
+    }
+
+    do {
+        ret = connect(upstream_fd, (struct sockaddr *)&target_addr, sizeof(target_addr));
+    } while (ret == -1 && errno == EINTR);
+
+    if (ret == -1) {
+        LOG_ERROR("udp proxy connect target failed: peer=%s, target=%s:%d, errno=%d",
+                  peer,
+                  channel->config.target_ip,
+                  channel->config.target_port,
+                  errno);
+        close(upstream_fd);
+        return -1;
+    }
+
+    req = malloc(sizeof(*req));
+    if (req == NULL) {
+        LOG_ERROR("malloc udp proxy request failed: peer=%s", peer);
+        close(upstream_fd);
+        return -1;
+    }
+
+    memset(req, 0, sizeof(*req));
+    req->event.event_type = EVENT_CONTEXT_UDP_UPSTREAM;
+    req->event.fd = upstream_fd;
+    req->client_fd = client_fd;
+    req->channel = channel->config;
+    req->peer_addr = *peer_addr;
+    req->peer_addr_len = peer_addr_len;
+    req->data_len = data_len;
+    req->created_at = time(NULL);
+    snprintf(req->peer, sizeof(req->peer), "%s", peer);
+    memcpy(req->data, data, data_len);
+
+    ret = flush_udp_proxy_request(req);
+    if (ret == -1) {
+        close(upstream_fd);
+        free(req);
+        return -1;
+    }
+
+    if (addfd(epollfd, upstream_fd, udp_proxy_events(req), &req->event) == -1) {
+        close(upstream_fd);
+        free(req);
+        return -1;
+    }
+
+    udp_proxy_list_add(req);
+
+    LOG_INFO("udp proxy request started: fd=%d, peer=%s, target=%s:%d, pending_bytes=%zu",
+             upstream_fd,
+             req->peer,
+             req->channel.target_ip,
+             req->channel.target_port,
+             req->request_sent ? 0 : req->data_len);
+
+    return 0;
+}
+
+static void handle_udp_proxy_event(int epollfd,
+                                   udp_proxy_request_t *req,
+                                   uint32_t event_flags)
+{
+    char buf[IO_BUF_SIZE];
+    ssize_t n;
+    int ret;
+
+    if (req == NULL || req->event.fd < 0) {
+        return;
+    }
+
+    if ((event_flags & EPOLLOUT) != 0 && !req->request_sent) {
+        ret = flush_udp_proxy_request(req);
+        if (ret == -1) {
+            close_udp_proxy_request(epollfd, req, "send target failed");
+            return;
+        }
+
+        if (ret == 0) {
+            if (modfd(epollfd, req->event.fd, udp_proxy_events(req), &req->event) == -1) {
+                close_udp_proxy_request(epollfd, req, "update events failed");
+            }
+            return;
+        }
+
+        if (modfd(epollfd, req->event.fd, udp_proxy_events(req), &req->event) == -1) {
+            close_udp_proxy_request(epollfd, req, "update events failed");
+            return;
+        }
+    }
+
+    if ((event_flags & EPOLLIN) != 0) {
+        do {
+            n = recv(req->event.fd, buf, sizeof(buf), 0);
+        } while (n == -1 && errno == EINTR);
+
+        if (n == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+
+            LOG_ERROR("udp proxy recv target failed: peer=%s, target=%s:%d, errno=%d",
+                      req->peer,
+                      req->channel.target_ip,
+                      req->channel.target_port,
+                      errno);
+            close_udp_proxy_request(epollfd, req, "recv target failed");
+            return;
+        }
+
+        do {
+            ret = (int)sendto(req->client_fd,
+                              buf,
+                              (size_t)n,
+                              0,
+                              (struct sockaddr *)&req->peer_addr,
+                              req->peer_addr_len);
+        } while (ret == -1 && errno == EINTR);
+
+        if (ret == -1) {
+            LOG_ERROR("udp proxy send client failed: peer=%s, errno=%d",
+                      req->peer,
+                      errno);
+            close_udp_proxy_request(epollfd, req, "send client failed");
+            return;
+        }
+
+        LOG_INFO("udp proxy packet handled: peer=%s, target=%s:%d, bytes=%zd",
+                 req->peer,
+                 req->channel.target_ip,
+                 req->channel.target_port,
+                 n);
+        close_udp_proxy_request(epollfd, req, "request complete");
+        return;
+    }
+
+    if ((event_flags & (EPOLLERR | EPOLLHUP)) != 0) {
+        LOG_ERROR("udp proxy target event: peer=%s, target=%s:%d, events=%u",
+                  req->peer,
+                  req->channel.target_ip,
+                  req->channel.target_port,
+                  event_flags);
+        close_udp_proxy_request(epollfd, req, "target event error");
+    }
 }
 
 static int create_tcp_fd(const listener_config_t *channel, int *connected)
@@ -1459,119 +1775,6 @@ static void process_tcp_proxy_client(task_t *task)
              task->channel.target_port);
 }
 
-static void process_udp_proxy_packet(task_t *task)
-{
-    int upstream_fd;
-    int ret;
-    char buf[IO_BUF_SIZE];
-    struct sockaddr_in target_addr;
-    struct pollfd pfd;
-    ssize_t n;
-
-    if (build_proxy_target_addr(&task->channel, &target_addr) == -1) {
-        return;
-    }
-
-    upstream_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (upstream_fd == -1) {
-        LOG_ERROR("udp proxy target socket failed: peer=%s, errno=%d",
-                  task->peer,
-                  errno);
-        return;
-    }
-
-    if (connect(upstream_fd, (struct sockaddr *)&target_addr, sizeof(target_addr)) == -1) {
-        LOG_ERROR("udp proxy connect target failed: peer=%s, target=%s:%d, errno=%d",
-                  task->peer,
-                  task->channel.target_ip,
-                  task->channel.target_port,
-                  errno);
-        close(upstream_fd);
-        return;
-    }
-
-    n = send(upstream_fd, task->data, task->data_len, 0);
-    if (n == -1 || n != (ssize_t)task->data_len) {
-        LOG_ERROR("udp proxy send target failed: peer=%s, target=%s:%d, bytes=%zu, sent=%zd, errno=%d",
-                  task->peer,
-                  task->channel.target_ip,
-                  task->channel.target_port,
-                  task->data_len,
-                  n,
-                  errno);
-        close(upstream_fd);
-        return;
-    }
-
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.fd = upstream_fd;
-    pfd.events = POLLIN;
-
-    do {
-        ret = poll(&pfd, 1, UDP_PROXY_TIMEOUT_MS);
-    } while (ret == -1 && errno == EINTR);
-
-    if (ret == 0) {
-        LOG_WARN("udp proxy target timeout: peer=%s, target=%s:%d",
-                 task->peer,
-                 task->channel.target_ip,
-                 task->channel.target_port);
-        close(upstream_fd);
-        return;
-    }
-
-    if (ret == -1) {
-        LOG_ERROR("udp proxy poll target failed: peer=%s, target=%s:%d, errno=%d",
-                  task->peer,
-                  task->channel.target_ip,
-                  task->channel.target_port,
-                  errno);
-        close(upstream_fd);
-        return;
-    }
-
-    if ((pfd.revents & POLLIN) == 0) {
-        LOG_ERROR("udp proxy target event: peer=%s, target=%s:%d, events=%d",
-                  task->peer,
-                  task->channel.target_ip,
-                  task->channel.target_port,
-                  pfd.revents);
-        close(upstream_fd);
-        return;
-    }
-
-    n = recv(upstream_fd, buf, sizeof(buf), 0);
-    if (n == -1) {
-        LOG_ERROR("udp proxy recv target failed: peer=%s, target=%s:%d, errno=%d",
-                  task->peer,
-                  task->channel.target_ip,
-                  task->channel.target_port,
-                  errno);
-        close(upstream_fd);
-        return;
-    }
-
-    ret = (int)sendto(task->client_fd,
-                      buf,
-                      (size_t)n,
-                      0,
-                      (struct sockaddr *)&task->peer_addr,
-                      task->peer_addr_len);
-    if (ret == -1) {
-        LOG_ERROR("udp proxy send client failed: peer=%s, errno=%d",
-                  task->peer,
-                  errno);
-    } else {
-        LOG_INFO("udp proxy packet handled: peer=%s, target=%s:%d, bytes=%zd",
-                 task->peer,
-                 task->channel.target_ip,
-                 task->channel.target_port,
-                 n);
-    }
-
-    close(upstream_fd);
-}
-
 static int dispatch_tcp_proxy_client(int epoll_fd,channel_context_t *channel,
                                      int client_fd,
                                      const struct sockaddr_in *peer_addr)
@@ -1796,34 +1999,26 @@ static void handle_udp_echo_packets(channel_context_t *channel)
     }
 }
 
-static void dispatch_udp_packets(channel_context_t *channel)
+static void dispatch_udp_packets(channel_context_t *channel, int epollfd)
 {
     int udp_fd = channel->event.fd;
+    char buf[IO_BUF_SIZE];
 
     for (;;) {
-        task_t *task;
         char peer_ip[INET_ADDRSTRLEN] = {0};
+        char peer[64];
         struct sockaddr_in peer_addr;
         socklen_t peer_len = sizeof(peer_addr);
         ssize_t n;
 
-        task = malloc(sizeof(*task));
-        if (task == NULL) {
-            LOG_ERROR("malloc udp task failed: fd=%d", udp_fd);
-            return;
-        }
-
-        memset(task, 0, sizeof(*task));
         n = recvfrom(udp_fd,
-                     task->data,
-                     sizeof(task->data),
+                     buf,
+                     sizeof(buf),
                      0,
                      (struct sockaddr *)&peer_addr,
                      &peer_len);
 
         if (n == -1) {
-            free(task);
-
             if (errno == EINTR) {
                 continue;
             }
@@ -1836,33 +2031,32 @@ static void dispatch_udp_packets(channel_context_t *channel)
             return;
         }
 
-        task->task_type = TASK_UDP_PACKET;
-        task->channel = channel->config;
-        task->client_fd = udp_fd;
-        task->peer_addr = peer_addr;
-        task->peer_addr_len = peer_len;
-        task->data_len = (size_t)n;
-
         if (inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip)) == NULL) {
             snprintf(peer_ip, sizeof(peer_ip), "unknown");
         }
 
-        snprintf(task->peer,
-                 sizeof(task->peer),
+        snprintf(peer,
+                 sizeof(peer),
                  "%s:%u",
                  peer_ip,
                  (unsigned int)ntohs(peer_addr.sin_port));
 
-        if (task_queue_push(&g_queue, task) == -1) {
-            free(task);
-            return;
+        if (start_udp_proxy_request(epollfd,
+                                    channel,
+                                    udp_fd,
+                                    &peer_addr,
+                                    peer_len,
+                                    peer,
+                                    buf,
+                                    (size_t)n) == -1) {
+            continue;
         }
 
-        LOG_INFO("udp packet dispatched: fd=%d, peer=%s, bytes=%zd, service_type=%d",
+        LOG_INFO("udp proxy packet accepted: fd=%d, peer=%s, bytes=%zd, service_type=%d",
                  udp_fd,
-                 task->peer,
+                 peer,
                  n,
-                 task->channel.service_type);
+                 channel->config.service_type);
     }
 }
 
@@ -2167,6 +2361,13 @@ int main_t(int argc, char *argv[])
                 continue;
             }
             //触发了开始回包
+            if (event_context->event_type == EVENT_CONTEXT_UDP_UPSTREAM) {
+                handle_udp_proxy_event(epollfd,
+                                       (udp_proxy_request_t *)event_context,
+                                       event_flags);
+                continue;
+            }
+
             if (event_context->event_type == EVENT_CONTEXT_TCP_CONN ||
                 event_context->event_type == EVENT_CONTEXT_TCP_UPSTREAM) {
                 tcp_conn_t *event_con = tcp_conn_from_event_context(event_context);
@@ -2214,7 +2415,7 @@ int main_t(int argc, char *argv[])
                     if (channel->config.service_type == SERVICE_TYPE_ECHO) {
                         handle_udp_echo_packets(channel);
                     } else {
-                        dispatch_udp_packets(channel);
+                        dispatch_udp_packets(channel, epollfd);
                     }
                 } else {
                     accept_clients(channel, epollfd);
@@ -2225,11 +2426,13 @@ int main_t(int argc, char *argv[])
         free_deferred_tcp_conns();
 
         close_idle_tcp_conns(epollfd);
+        close_expired_udp_proxy_requests(epollfd);
     }
 quit:
     g_defer_tcp_conn_free = 0;
     free_deferred_tcp_conns();
     close_all_tcp_conns(epollfd);
+    close_all_udp_proxy_requests(epollfd);
 
     for (i = 0; i < listen_count; i++) {
         if (channels[i].event.fd >= 0) {
